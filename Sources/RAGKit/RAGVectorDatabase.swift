@@ -159,9 +159,9 @@ public final class RAGVectorDatabase {
     public func needsEmbedding() async -> Bool {
         guard let database else { return true }
         do {
-            // Try a simple search to check if DB has content
-            let results = try await database.search(query: .text("test"), numResults: 1, threshold: 0.0)
-            return results.isEmpty
+            // Read storage directly rather than running a probe search, which
+            // would force the embedding model to load (and possibly download).
+            return try await database.getAllDocuments().isEmpty
         } catch {
             RAGLog.warning("⚠️ Could not check vector DB content: \(error)")
             return true
@@ -234,6 +234,107 @@ public final class RAGVectorDatabase {
 
         RAGLog.debug("🎉 Successfully embedded \(embeddedIDs.count) documents")
         return embeddedIDs
+    }
+
+    // MARK: - Incremental Updates
+
+    /// Number of documents currently in the index.
+    public func documentCount() async throws -> Int {
+        guard let database else { throw RAGError.notInitialized }
+        return try await database.getAllDocuments().count
+    }
+
+    /// The indexed text keyed by document ID, so hosts can diff their corpus
+    /// against the index and re-embed only what actually changed.
+    public func indexedDocumentTexts() async throws -> [UUID: String] {
+        guard let database else { throw RAGError.notInitialized }
+        let documents = try await database.getAllDocuments()
+        return Dictionary(documents.map { ($0.id, $0.text) }) { _, latest in latest }
+    }
+
+    /// The indexed text for one document, or `nil` when it is not indexed.
+    public func documentText(id: UUID) async throws -> String? {
+        guard let database else { throw RAGError.notInitialized }
+        return try await database.getDocument(id: id)?.text
+    }
+
+    /// Embeds the given documents in place without resetting the database;
+    /// a document whose ID is already indexed is replaced. Documents with
+    /// empty text and individual embedding failures are logged and skipped.
+    /// - Returns: The IDs of documents that embedded successfully.
+    @discardableResult
+    public func upsertDocuments(
+        _ documents: [RAGDocument],
+        batchSize: Int = 20,
+        progress: EmbeddingProgressTracker? = nil
+    ) async throws -> [UUID] {
+        guard let database else {
+            throw RAGError.notInitialized
+        }
+
+        let embeddable = documents.filter {
+            !$0.text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+        }
+        if embeddable.count != documents.count {
+            RAGLog.warning("⚠️ Skipping \(documents.count - embeddable.count) documents with empty text")
+        }
+        guard !embeddable.isEmpty else { return [] }
+
+        let totalBatches = (embeddable.count + batchSize - 1) / batchSize
+        progress?.startEmbedding(totalBatches: totalBatches)
+
+        var embeddedIDs: [UUID] = []
+        embeddedIDs.reserveCapacity(embeddable.count)
+
+        for batchIndex in 0..<totalBatches {
+            try Task.checkCancellation()
+
+            let startIdx = batchIndex * batchSize
+            let endIdx = min(startIdx + batchSize, embeddable.count)
+            let batch = Array(embeddable[startIdx..<endIdx])
+
+            progress?.updateProgress(
+                batch: batchIndex + 1,
+                message: "Embedding batch \(batchIndex + 1) of \(totalBatches)..."
+            )
+
+            // Delete before re-adding: storage overwrites by ID, but the text
+            // index keeps per-ID entries, so a bare re-add would double-count.
+            // Deleting an ID that is not indexed is a no-op.
+            do {
+                try await database.deleteDocuments(ids: batch.map(\.id))
+            } catch {
+                RAGLog.warning("⚠️ Could not clear existing documents before upsert: \(error)")
+            }
+
+            do {
+                _ = try await database.addDocuments(texts: batch.map(\.text), ids: batch.map(\.id))
+                embeddedIDs.append(contentsOf: batch.map(\.id))
+            } catch {
+                // One bad document fails the whole batch call, so retry one by one.
+                for document in batch {
+                    do {
+                        _ = try await database.addDocument(text: document.text, id: document.id)
+                        embeddedIDs.append(document.id)
+                    } catch {
+                        RAGLog.warning("⚠️ Failed to embed document \(document.id): \(error)")
+                    }
+                }
+            }
+        }
+
+        progress?.finishEmbedding(success: true)
+
+        RAGLog.debug("🔁 Upserted \(embeddedIDs.count) of \(embeddable.count) documents")
+        return embeddedIDs
+    }
+
+    /// Removes documents from the index. Unknown IDs are ignored.
+    public func deleteDocuments(ids: [UUID]) async throws {
+        guard let database else { throw RAGError.notInitialized }
+        guard !ids.isEmpty else { return }
+        try await database.deleteDocuments(ids: ids)
+        RAGLog.debug("🗑️ Deleted \(ids.count) documents from the index")
     }
 
     // MARK: - Snapshot Export/Import

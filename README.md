@@ -2,8 +2,9 @@
 
 Generic on-device RAG engine extracted from the Nimue app: a VecturaKit-backed
 vector database with bundled-seed setup, local/remote embedding-model
-resolution, batched document embedding with progress reporting, snapshot
-export/import, and MMR result diversification.
+resolution, batched document embedding with progress reporting, incremental
+upsert/delete for live corpora, snapshot export/import, and MMR result
+diversification.
 
 ## What lives here
 
@@ -12,6 +13,14 @@ export/import, and MMR result diversification.
   repair, search, batched `embedDocuments`, and snapshot export/import.
   Configured through `RAGVectorDatabaseConfiguration`; not thread-safe on its
   own — own it from a single actor.
+
+  Two write paths cover the two corpus shapes:
+  - `embedDocuments` resets the database and re-embeds everything — for a
+    static corpus shipped or rebuilt as a unit (a bundled seed).
+  - `upsertDocuments` / `deleteDocuments` change the index in place — for a
+    live corpus that changes one document at a time (user content). Hosts diff
+    against `indexedDocumentTexts()` (or `documentText(id:)` for one document)
+    to re-embed only what changed.
 - `RAGDocument` — id + text pair to embed. Hosts keep richer metadata in their
   own lookup keyed by the document ID.
 - `MMRDiversifier` — Maximal Marginal Relevance re-ranking with an optional
