@@ -16,7 +16,7 @@ import ZIPFoundation
 
 // MARK: - Configuration
 
-public struct RAGVectorDatabaseConfiguration {
+public struct RAGVectorDatabaseConfiguration: Sendable {
     /// VecturaKit database name; storage lives in a subdirectory with this name.
     public var name: String
     /// Embedding dimension (must match the embedding model).
@@ -64,7 +64,7 @@ public struct RAGVectorDatabaseConfiguration {
 
 /// A document to embed: a stable ID plus the text that gets vectorized.
 /// Hosts keep any richer metadata in their own lookup keyed by `id`.
-public struct RAGDocument {
+public struct RAGDocument: Sendable {
     public let id: UUID
     public let text: String
 
@@ -76,7 +76,11 @@ public struct RAGDocument {
 
 // MARK: - Engine
 
-public final class RAGVectorDatabase {
+/// `@unchecked Sendable` carries the class's documented contract into the type
+/// system: the engine has no internal synchronization, and the host keeps it
+/// safe by owning it from a single actor (which Swift 6 callers could not even
+/// express against a non-Sendable class).
+public final class RAGVectorDatabase: @unchecked Sendable {
     public let configuration: RAGVectorDatabaseConfiguration
 
     public private(set) var database: VecturaKit?
