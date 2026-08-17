@@ -62,15 +62,35 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
 
 // MARK: - Document
 
-/// A document to embed: a stable ID plus the text that gets vectorized.
-/// Hosts keep any richer metadata in their own lookup keyed by `id`.
+/// A document to embed: a stable ID, the text that gets vectorized, and the
+/// date the document belongs to. Hosts keep any richer metadata in their own
+/// lookup keyed by `id`.
 public struct RAGDocument: Sendable {
     public let id: UUID
     public let text: String
+    /// The document's own date — a note's capture time, an event's start —
+    /// stored next to the vector so searches can narrow the corpus by date
+    /// *before* ranking it. `nil` falls back to the moment of indexing, which
+    /// is only the same thing for a corpus that is never re-embedded.
+    public let date: Date?
 
-    public init(id: UUID, text: String) {
+    public init(id: UUID, text: String, date: Date? = nil) {
         self.id = id
         self.text = text
+        self.date = date
+    }
+}
+
+/// What the index currently holds for one document: the text that was embedded
+/// and the date stored with its vector. Hosts diff against this to re-embed
+/// only the documents whose text or date actually changed.
+public struct RAGIndexedDocument: Sendable, Equatable {
+    public let text: String
+    public let date: Date
+
+    public init(text: String, date: Date) {
+        self.text = text
+        self.date = date
     }
 }
 
@@ -87,6 +107,12 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     public private(set) var directoryURL: URL?
     /// Incremented after snapshot imports so UIs can reload.
     public private(set) var revision: Int = 0
+
+    /// Kept from `setUp` so date-filtered searches can rank a subset of the
+    /// corpus with the same embedder and settings as an unfiltered one.
+    private var embedder: (any VecturaEmbedder)?
+    private var vecturaConfig: VecturaConfig?
+    private var storage: RAGDateStampingStorage?
 
     public init(configuration: RAGVectorDatabaseConfiguration) {
         self.configuration = configuration
@@ -120,7 +146,24 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             )
 
             let embedder = SwiftEmbedder(modelSource: embedderSource())
-            self.database = try await VecturaKit(config: config, embedder: embedder)
+            // VecturaKit would build this provider itself, at exactly this
+            // path and with these permissions; RAGKit builds it so it can wrap
+            // it and stamp host dates onto the records as they are written.
+            let storageDirectory = dbDir.appendingPathComponent(configuration.name, isDirectory: true)
+            if !FileManager.default.fileExists(atPath: storageDirectory.path) {
+                try FileManager.default.createDirectory(
+                    at: storageDirectory,
+                    withIntermediateDirectories: true,
+                    attributes: [.posixPermissions: 0o700]
+                )
+            }
+            let fileStorage = try FileStorageProvider(storageDirectory: storageDirectory, cacheEnabled: true)
+            let storage = RAGDateStampingStorage(base: fileStorage)
+
+            self.embedder = embedder
+            self.vecturaConfig = config
+            self.storage = storage
+            self.database = try await VecturaKit(config: config, embedder: embedder, storageProvider: storage)
             RAGLog.debug("📁 Vectura DB directory: \(dbDir.path)")
 
             let fm = FileManager.default
@@ -146,15 +189,67 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
     // MARK: - Search
 
-    public func search(query: String, numResults: Int, threshold: Float? = nil) async throws -> [VecturaSearchResult] {
+    /// Ranks the corpus against `query`, optionally restricted to documents
+    /// whose stored date falls inside `dateRange`.
+    ///
+    /// The range is a *pre* filter: it narrows the corpus before ranking, so a
+    /// query about one week returns that week's best matches instead of
+    /// whatever is left after filtering a global top-K — which, for a narrow
+    /// window over a large corpus, is usually nothing. Results carry the
+    /// stored date as `createdAt`.
+    ///
+    /// - Note: A filtered search builds a throwaway engine over the matching
+    ///   slice, so its text index is rebuilt per call. That is proportional to
+    ///   the slice, not the corpus, and unfiltered searches are untouched.
+    public func search(
+        query: String,
+        numResults: Int,
+        threshold: Float? = nil,
+        dateRange: Range<Date>? = nil
+    ) async throws -> [VecturaSearchResult] {
         guard let database else {
             throw RAGError.notInitialized
         }
-        return try await database.search(
+        guard let dateRange else {
+            return try await database.search(
+                query: .text(query),
+                numResults: numResults,
+                threshold: threshold
+            )
+        }
+        guard let embedder, let vecturaConfig else {
+            throw RAGError.notInitialized
+        }
+
+        let inRange = try await database.getAllDocuments().filter { dateRange.contains($0.createdAt) }
+        guard !inRange.isEmpty else {
+            RAGLog.debug("🔎 No documents dated inside the requested range")
+            return []
+        }
+
+        let scoped = try await VecturaKit(
+            config: vecturaConfig,
+            embedder: embedder,
+            storageProvider: RAGDocumentSubsetStorage(documents: inRange)
+        )
+        let results = try await scoped.search(
             query: .text(query),
             numResults: numResults,
             threshold: threshold
         )
+
+        // The text engine keeps its own copy of each document's timestamp,
+        // taken before storage stamped the host date on it, so read the date
+        // back from the records that were actually filtered.
+        let dates = Dictionary(inRange.map { ($0.id, $0.createdAt) }) { _, latest in latest }
+        return results.map { result in
+            VecturaSearchResult(
+                id: result.id,
+                text: result.text,
+                score: result.score,
+                createdAt: dates[result.id] ?? result.createdAt
+            )
+        }
     }
 
     // MARK: - Embedding
@@ -218,6 +313,8 @@ public final class RAGVectorDatabase: @unchecked Sendable {
                 message: "Embedding batch \(batchIndex + 1) of \(totalBatches)..."
             )
 
+            await stampDates(of: batch)
+
             for document in batch {
                 do {
                     _ = try await database.addDocument(
@@ -230,6 +327,8 @@ public final class RAGVectorDatabase: @unchecked Sendable {
                     // Continue with other documents
                 }
             }
+
+            await storage?.discardPendingDates(for: batch.map(\.id))
 
             RAGLog.debug("✅ Completed batch \(batchIndex + 1)/\(totalBatches)")
         }
@@ -251,15 +350,30 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// The indexed text keyed by document ID, so hosts can diff their corpus
     /// against the index and re-embed only what actually changed.
     public func indexedDocumentTexts() async throws -> [UUID: String] {
+        try await indexedDocuments().mapValues(\.text)
+    }
+
+    /// The indexed text *and stored date* keyed by document ID. Hosts whose
+    /// documents carry dates should diff against this, so a record left over
+    /// from before its date was known gets re-embedded with it.
+    public func indexedDocuments() async throws -> [UUID: RAGIndexedDocument] {
         guard let database else { throw RAGError.notInitialized }
         let documents = try await database.getAllDocuments()
-        return Dictionary(documents.map { ($0.id, $0.text) }) { _, latest in latest }
+        let pairs = documents.map { ($0.id, RAGIndexedDocument(text: $0.text, date: $0.createdAt)) }
+        return Dictionary(pairs) { _, latest in latest }
     }
 
     /// The indexed text for one document, or `nil` when it is not indexed.
     public func documentText(id: UUID) async throws -> String? {
+        try await indexedDocument(id: id)?.text
+    }
+
+    /// The indexed text and stored date for one document, or `nil` when it is
+    /// not indexed.
+    public func indexedDocument(id: UUID) async throws -> RAGIndexedDocument? {
         guard let database else { throw RAGError.notInitialized }
-        return try await database.getDocument(id: id)?.text
+        guard let document = try await database.getDocument(id: id) else { return nil }
+        return RAGIndexedDocument(text: document.text, date: document.createdAt)
     }
 
     /// Embeds the given documents in place without resetting the database;
@@ -311,6 +425,8 @@ public final class RAGVectorDatabase: @unchecked Sendable {
                 RAGLog.warning("⚠️ Could not clear existing documents before upsert: \(error)")
             }
 
+            await stampDates(of: batch)
+
             do {
                 _ = try await database.addDocuments(texts: batch.map(\.text), ids: batch.map(\.id))
                 embeddedIDs.append(contentsOf: batch.map(\.id))
@@ -325,6 +441,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
                     }
                 }
             }
+
+            // A document that never made it to storage left its date behind;
+            // drop it so it cannot land on some later write of the same ID.
+            await storage?.discardPendingDates(for: batch.map(\.id))
         }
 
         progress?.finishEmbedding(success: true)
@@ -498,6 +618,18 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     }
 
     // MARK: - Private Helpers
+
+    /// Hands the batch's dates to storage so they land on the records these
+    /// documents are about to be written into. Documents without a date keep
+    /// VecturaKit's own timestamp.
+    private func stampDates(of batch: [RAGDocument]) async {
+        guard let storage else { return }
+        let dates = batch.reduce(into: [UUID: Date]()) { dates, document in
+            if let date = document.date { dates[document.id] = date }
+        }
+        guard !dates.isEmpty else { return }
+        await storage.stampNextSave(of: dates)
+    }
 
     private func prepareSeedDirectory(forceReset: Bool = false) throws -> URL {
         let fm = FileManager.default

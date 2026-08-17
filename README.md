@@ -19,10 +19,18 @@ diversification.
     static corpus shipped or rebuilt as a unit (a bundled seed).
   - `upsertDocuments` / `deleteDocuments` change the index in place — for a
     live corpus that changes one document at a time (user content). Hosts diff
-    against `indexedDocumentTexts()` (or `documentText(id:)` for one document)
+    against `indexedDocuments()` (or `indexedDocument(id:)` for one document)
     to re-embed only what changed.
-- `RAGDocument` — id + text pair to embed. Hosts keep richer metadata in their
-  own lookup keyed by the document ID.
+
+  `search(query:numResults:threshold:dateRange:)` takes an optional date
+  range. It is a *pre* filter: the corpus is narrowed to the documents dated
+  inside the range and the same engine ranks what is left, so a question about
+  one week returns that week's best matches instead of whatever survives
+  filtering a global top-K.
+- `RAGDocument` — id, text, and the document's own `date`, stored beside the
+  vector so date filtering needs no sidecar file and survives snapshot
+  export/import. Hosts keep richer metadata in their own lookup keyed by the
+  document ID.
 - `MMRDiversifier` — Maximal Marginal Relevance re-ranking with an optional
   host-supplied concept key for duplicate collapsing.
 - `EmbeddingProgressTracker` — `ObservableObject` progress for embedding UI.
