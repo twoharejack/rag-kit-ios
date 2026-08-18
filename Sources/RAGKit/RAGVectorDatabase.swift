@@ -63,8 +63,8 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
 // MARK: - Document
 
 /// A document to embed: a stable ID, the text that gets vectorized, and the
-/// date the document belongs to. Hosts keep any richer metadata in their own
-/// lookup keyed by `id`.
+/// date and filter tags the document belongs to. Hosts keep any richer
+/// metadata in their own lookup keyed by `id`.
 public struct RAGDocument: Sendable {
     public let id: UUID
     public let text: String
@@ -73,24 +73,31 @@ public struct RAGDocument: Sendable {
     /// *before* ranking it. `nil` falls back to the moment of indexing, which
     /// is only the same thing for a corpus that is never re-embedded.
     public let date: Date?
+    /// Filter labels stored beside the vector — a note's hashtags, an event's
+    /// categories. Matched verbatim at search time, so hosts canonicalize them
+    /// (case, diacritics, prefixes) the same way on both sides.
+    public let tags: [String]
 
-    public init(id: UUID, text: String, date: Date? = nil) {
+    public init(id: UUID, text: String, date: Date? = nil, tags: [String] = []) {
         self.id = id
         self.text = text
         self.date = date
+        self.tags = tags
     }
 }
 
 /// What the index currently holds for one document: the text that was embedded
-/// and the date stored with its vector. Hosts diff against this to re-embed
-/// only the documents whose text or date actually changed.
+/// and the date and tags stored with its vector. Hosts diff against this to
+/// re-embed only the documents whose text, date, or tags actually changed.
 public struct RAGIndexedDocument: Sendable, Equatable {
     public let text: String
     public let date: Date
+    public let tags: [String]
 
-    public init(text: String, date: Date) {
+    public init(text: String, date: Date, tags: [String] = []) {
         self.text = text
         self.date = date
+        self.tags = tags
     }
 }
 
@@ -108,11 +115,12 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// Incremented after snapshot imports so UIs can reload.
     public private(set) var revision: Int = 0
 
-    /// Kept from `setUp` so date-filtered searches can rank a subset of the
+    /// Kept from `setUp` so filtered searches can rank a subset of the
     /// corpus with the same embedder and settings as an unfiltered one.
     private var embedder: (any VecturaEmbedder)?
     private var vecturaConfig: VecturaConfig?
     private var storage: RAGDateStampingStorage?
+    private var tagStore: RAGDocumentTagStore?
 
     public init(configuration: RAGVectorDatabaseConfiguration) {
         self.configuration = configuration
@@ -163,6 +171,12 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             self.embedder = embedder
             self.vecturaConfig = config
             self.storage = storage
+            // Lives at the directory root (not inside VecturaKit's storage
+            // subdirectory, whose loader decodes every .json as a document),
+            // so snapshot export/import carries it with the vectors.
+            self.tagStore = RAGDocumentTagStore(
+                fileURL: dbDir.appendingPathComponent("document-tags.json")
+            )
             self.database = try await VecturaKit(config: config, embedder: embedder, storageProvider: storage)
             RAGLog.debug("📁 Vectura DB directory: \(dbDir.path)")
 
@@ -190,13 +204,15 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     // MARK: - Search
 
     /// Ranks the corpus against `query`, optionally restricted to documents
-    /// whose stored date falls inside `dateRange`.
+    /// whose stored date falls inside `dateRange` and/or that carry at least
+    /// one of `tags` (compared verbatim against the tags they were indexed
+    /// with).
     ///
-    /// The range is a *pre* filter: it narrows the corpus before ranking, so a
-    /// query about one week returns that week's best matches instead of
-    /// whatever is left after filtering a global top-K — which, for a narrow
-    /// window over a large corpus, is usually nothing. Results carry the
-    /// stored date as `createdAt`.
+    /// Both are *pre* filters: they narrow the corpus before ranking, so a
+    /// query about one week or one tag returns that slice's best matches
+    /// instead of whatever is left after filtering a global top-K — which,
+    /// for a narrow slice over a large corpus, is usually nothing. Results
+    /// carry the stored date as `createdAt`.
     ///
     /// - Note: A filtered search builds a throwaway engine over the matching
     ///   slice, so its text index is rebuilt per call. That is proportional to
@@ -205,12 +221,14 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         query: String,
         numResults: Int,
         threshold: Float? = nil,
-        dateRange: Range<Date>? = nil
+        dateRange: Range<Date>? = nil,
+        tags: [String]? = nil
     ) async throws -> [VecturaSearchResult] {
         guard let database else {
             throw RAGError.notInitialized
         }
-        guard let dateRange else {
+        let tagFilter = (tags?.isEmpty == false) ? tags : nil
+        guard dateRange != nil || tagFilter != nil else {
             return try await database.search(
                 query: .text(query),
                 numResults: numResults,
@@ -221,9 +239,16 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             throw RAGError.notInitialized
         }
 
-        let inRange = try await database.getAllDocuments().filter { dateRange.contains($0.createdAt) }
+        var inRange = try await database.getAllDocuments()
+        if let dateRange {
+            inRange = inRange.filter { dateRange.contains($0.createdAt) }
+        }
+        if let tagFilter {
+            let tagged = await tagStore?.ids(withAnyOf: tagFilter) ?? []
+            inRange = inRange.filter { tagged.contains($0.id) }
+        }
         guard !inRange.isEmpty else {
-            RAGLog.debug("🔎 No documents dated inside the requested range")
+            RAGLog.debug("🔎 No documents match the requested filters")
             return []
         }
 
@@ -253,6 +278,17 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     }
 
     // MARK: - Embedding
+
+    /// Embeds arbitrary text with the database's own model — the same vector a
+    /// document with this text would be indexed under. Hosts use it to derive
+    /// features from positions in the embedding space (similarity, colors)
+    /// without writing anything into the index.
+    public func embedText(_ text: String) async throws -> [Float] {
+        guard let embedder else {
+            throw RAGError.notInitialized
+        }
+        return try await embedder.embed(text: text)
+    }
 
     /// Checks if the database needs embedding (is empty or missing).
     public func needsEmbedding() async -> Bool {
@@ -292,6 +328,7 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         } catch {
             RAGLog.warning("⚠️ Could not reset vector DB before embedding: \(error)")
         }
+        await tagStore?.removeAll()
 
         let totalBatches = (documents.count + batchSize - 1) / batchSize
         RAGLog.debug("📝 Starting embedding of \(documents.count) documents in \(totalBatches) batches")
@@ -315,20 +352,23 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
             await stampDates(of: batch)
 
+            var batchEmbeddedIDs: [UUID] = []
             for document in batch {
                 do {
                     _ = try await database.addDocument(
                         text: document.text,
                         id: document.id
                     )
-                    embeddedIDs.append(document.id)
+                    batchEmbeddedIDs.append(document.id)
                 } catch {
                     RAGLog.warning("⚠️ Failed to embed document \(document.id): \(error)")
                     // Continue with other documents
                 }
             }
+            embeddedIDs.append(contentsOf: batchEmbeddedIDs)
 
             await storage?.discardPendingDates(for: batch.map(\.id))
+            await stampTags(of: batch, embeddedIDs: batchEmbeddedIDs)
 
             RAGLog.debug("✅ Completed batch \(batchIndex + 1)/\(totalBatches)")
         }
@@ -353,13 +393,16 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         try await indexedDocuments().mapValues(\.text)
     }
 
-    /// The indexed text *and stored date* keyed by document ID. Hosts whose
-    /// documents carry dates should diff against this, so a record left over
-    /// from before its date was known gets re-embedded with it.
+    /// The indexed text, *stored date, and tags* keyed by document ID. Hosts
+    /// whose documents carry dates or tags should diff against this, so a
+    /// record left over from before they were known gets re-embedded with them.
     public func indexedDocuments() async throws -> [UUID: RAGIndexedDocument] {
         guard let database else { throw RAGError.notInitialized }
         let documents = try await database.getAllDocuments()
-        let pairs = documents.map { ($0.id, RAGIndexedDocument(text: $0.text, date: $0.createdAt)) }
+        let tags = await tagStore?.allTags() ?? [:]
+        let pairs = documents.map {
+            ($0.id, RAGIndexedDocument(text: $0.text, date: $0.createdAt, tags: tags[$0.id] ?? []))
+        }
         return Dictionary(pairs) { _, latest in latest }
     }
 
@@ -368,12 +411,13 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         try await indexedDocument(id: id)?.text
     }
 
-    /// The indexed text and stored date for one document, or `nil` when it is
-    /// not indexed.
+    /// The indexed text, stored date, and tags for one document, or `nil` when
+    /// it is not indexed.
     public func indexedDocument(id: UUID) async throws -> RAGIndexedDocument? {
         guard let database else { throw RAGError.notInitialized }
         guard let document = try await database.getDocument(id: id) else { return nil }
-        return RAGIndexedDocument(text: document.text, date: document.createdAt)
+        let tags = await tagStore?.tags(for: id) ?? []
+        return RAGIndexedDocument(text: document.text, date: document.createdAt, tags: tags)
     }
 
     /// Embeds the given documents in place without resetting the database;
@@ -427,24 +471,27 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
             await stampDates(of: batch)
 
+            var batchEmbeddedIDs: [UUID] = []
             do {
                 _ = try await database.addDocuments(texts: batch.map(\.text), ids: batch.map(\.id))
-                embeddedIDs.append(contentsOf: batch.map(\.id))
+                batchEmbeddedIDs = batch.map(\.id)
             } catch {
                 // One bad document fails the whole batch call, so retry one by one.
                 for document in batch {
                     do {
                         _ = try await database.addDocument(text: document.text, id: document.id)
-                        embeddedIDs.append(document.id)
+                        batchEmbeddedIDs.append(document.id)
                     } catch {
                         RAGLog.warning("⚠️ Failed to embed document \(document.id): \(error)")
                     }
                 }
             }
+            embeddedIDs.append(contentsOf: batchEmbeddedIDs)
 
             // A document that never made it to storage left its date behind;
             // drop it so it cannot land on some later write of the same ID.
             await storage?.discardPendingDates(for: batch.map(\.id))
+            await stampTags(of: batch, embeddedIDs: batchEmbeddedIDs)
         }
 
         progress?.finishEmbedding(success: true)
@@ -458,6 +505,7 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         guard let database else { throw RAGError.notInitialized }
         guard !ids.isEmpty else { return }
         try await database.deleteDocuments(ids: ids)
+        await tagStore?.removeTags(for: ids)
         RAGLog.debug("🗑️ Deleted \(ids.count) documents from the index")
     }
 
@@ -629,6 +677,19 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         }
         guard !dates.isEmpty else { return }
         await storage.stampNextSave(of: dates)
+    }
+
+    /// Records the tags of the documents that actually reached the index, so a
+    /// failed embed cannot leave its tags claiming a document that isn't there.
+    /// Written per batch, not per run, so a cancellation mid-embed loses tags
+    /// only for documents whose vectors were also never written.
+    private func stampTags(of batch: [RAGDocument], embeddedIDs: [UUID]) async {
+        guard let tagStore else { return }
+        let embedded = Set(embeddedIDs)
+        let updates = batch.reduce(into: [UUID: [String]]()) { updates, document in
+            if embedded.contains(document.id) { updates[document.id] = document.tags }
+        }
+        await tagStore.setTags(updates)
     }
 
     private func prepareSeedDirectory(forceReset: Bool = false) throws -> URL {
