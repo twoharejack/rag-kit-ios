@@ -1,6 +1,6 @@
 // RAGSentenceEmbedder.swift
 // ============================================================================
-// The sentence encoder every RAGVectorDatabase embeds with: a BERT-family
+// The default engine a RAGVectorDatabase embeds with: a BERT-family
 // swift-embeddings model, run on the CPU, a couple of texts per pass.
 // ============================================================================
 
@@ -32,10 +32,14 @@ import VecturaEmbeddingsKit
 /// Vectors are unchanged. The model, the 512-token truncation and the
 /// first-token pooling are exactly what `SwiftEmbedder` produced for BERT, so
 /// databases and bundled seeds embedded before still answer new queries.
-public actor RAGSentenceEmbedder: VecturaEmbedder {
+public actor RAGSentenceEmbedder: RAGEmbedder {
     /// Two texts at the 512-token cap cost no more memory than one; four
     /// doubled the peak.
     public static let defaultMaxBatchSize = 2
+
+    /// The model's name: truncation and pooling never vary, so the model
+    /// alone decides where a text lands.
+    public nonisolated let spaceIdentifier: String
 
     private let modelSource: VecturaModelSource
     private let maxBatchSize: Int
@@ -45,15 +49,37 @@ public actor RAGSentenceEmbedder: VecturaEmbedder {
     /// - Parameters:
     ///   - modelSource: A local folder or Hugging Face ID of a BERT-architecture
     ///     sentence-transformer.
+    ///   - modelID: The model's Hugging Face ID, which names its vector space.
+    ///     Defaults to the ID of an `.id` source, or the folder name of a
+    ///     `.folder` one. Pass it when loading a local copy, so the copy and
+    ///     the download count as the same space.
     ///   - maxBatchSize: The most texts encoded in one forward pass. Larger
     ///     requests are split, so memory is bounded however many texts a
     ///     caller hands over at once.
     public init(
         modelSource: VecturaModelSource,
+        modelID: String? = nil,
         maxBatchSize: Int = RAGSentenceEmbedder.defaultMaxBatchSize
     ) {
         self.modelSource = modelSource
         self.maxBatchSize = max(1, maxBatchSize)
+        self.spaceIdentifier = Self.spaceIdentifier(forModelID: modelID ?? Self.defaultModelID(of: modelSource))
+    }
+
+    /// The vector space of `modelID`'s vectors. `RAGVectorDatabase` also
+    /// assigns it to databases that predate space records, all of which this
+    /// engine (or `SwiftEmbedder`, which made the same vectors) wrote.
+    static func spaceIdentifier(forModelID modelID: String) -> String {
+        "sentence-transformer:\(modelID)"
+    }
+
+    private static func defaultModelID(of source: VecturaModelSource) -> String {
+        switch source {
+        case .id(let id, _):
+            return id
+        case .folder(let url, _):
+            return url.lastPathComponent
+        }
     }
 
     public var dimension: Int {

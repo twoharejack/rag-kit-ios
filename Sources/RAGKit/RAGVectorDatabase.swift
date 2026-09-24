@@ -1,9 +1,10 @@
 // RAGVectorDatabase.swift
 // ============================================================================
 // Generic VecturaKit-backed vector database engine: on-disk setup and seeding,
-// embedder resolution, batched document embedding, and snapshot export/import.
-// Domain-agnostic — hosts supply seed archives, model folders, and document
-// texts, and keep their own document metadata keyed by document ID.
+// embedding-engine selection, batched document embedding, and snapshot
+// export/import. Domain-agnostic — hosts supply seed archives, model folders,
+// and document texts, and keep their own document metadata keyed by document
+// ID.
 //
 // Not thread-safe on its own: designed to be owned by a single actor (or other
 // single concurrency domain) in the host app.
@@ -19,7 +20,9 @@ import ZIPFoundation
 public struct RAGVectorDatabaseConfiguration: Sendable {
     /// VecturaKit database name; storage lives in a subdirectory with this name.
     public var name: String
-    /// Embedding dimension (must match the embedding model).
+    /// Embedding dimension of the sentence-transformer model below. Declared
+    /// so setup never loads the model to measure it. Other engines report
+    /// their own.
     public var dimension: Int
     /// Application Support subdirectory that holds the writable database.
     public var storageRootFolderName: String
@@ -35,7 +38,16 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
     /// Files that must exist inside `localModelFolderURL` for it to be used.
     public var requiredLocalModelFiles: [String]
     /// Remote model repository ID used when no valid local model folder exists.
+    /// It also names the sentence transformer's vector space.
     public var remoteModelID: String
+    /// The engine documents and queries are embedded with. The model fields
+    /// above only matter for `.sentenceTransformer`, the default.
+    ///
+    /// The database remembers which engine wrote its vectors. Opening it with
+    /// an engine that embeds into a different space clears it, and the host
+    /// re-embeds its corpus. A bundled seed from another engine is skipped the
+    /// same way.
+    public var embeddingEngine: RAGEmbeddingEngine
 
     public init(
         name: String,
@@ -46,7 +58,8 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
         bundledSeedFolderURL: URL? = nil,
         localModelFolderURL: URL? = nil,
         requiredLocalModelFiles: [String] = [],
-        remoteModelID: String
+        remoteModelID: String,
+        embeddingEngine: RAGEmbeddingEngine = .sentenceTransformer
     ) {
         self.name = name
         self.dimension = dimension
@@ -57,6 +70,7 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
         self.localModelFolderURL = localModelFolderURL
         self.requiredLocalModelFiles = requiredLocalModelFiles
         self.remoteModelID = remoteModelID
+        self.embeddingEngine = embeddingEngine
     }
 }
 
@@ -108,22 +122,29 @@ public struct RAGIndexedDocument: Sendable, Equatable {
 /// safe by owning it from a single actor (which Swift 6 callers could not even
 /// express against a non-Sendable class).
 public final class RAGVectorDatabase: @unchecked Sendable {
-    public let configuration: RAGVectorDatabaseConfiguration
+    /// Changes only through `switchEmbeddingEngine(to:)`.
+    public private(set) var configuration: RAGVectorDatabaseConfiguration
 
     public private(set) var database: VecturaKit?
     public private(set) var directoryURL: URL?
-    /// Incremented after snapshot imports so UIs can reload.
+    /// Incremented after snapshot imports and engine switches so UIs can reload.
     public private(set) var revision: Int = 0
 
     /// Kept from `setUp` so filtered searches can rank a subset of the
     /// corpus with the same embedder and settings as an unfiltered one.
-    private var embedder: (any VecturaEmbedder)?
+    private var embedder: (any RAGEmbedder)?
     private var vecturaConfig: VecturaConfig?
     private var storage: RAGDateStampingStorage?
     private var tagStore: RAGDocumentTagStore?
 
     public init(configuration: RAGVectorDatabaseConfiguration) {
         self.configuration = configuration
+    }
+
+    /// The vector space of the open database (see `RAGEmbedder`), or `nil`
+    /// before setup.
+    public var embeddingSpaceIdentifier: String? {
+        embedder?.spaceIdentifier
     }
 
     // MARK: - Setup
@@ -144,63 +165,109 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
     public func setUp(forceReset: Bool = false) async throws {
         do {
-            let dbDir = try prepareSeedDirectory(forceReset: forceReset)
-            self.directoryURL = dbDir
-
-            let config = try VecturaConfig(
-                name: configuration.name,
-                directoryURL: dbDir,
-                dimension: configuration.dimension
-            )
-
-            // Not VecturaEmbeddingsKit's SwiftEmbedder: its GPU path leaks a
-            // compiled graph per input shape and a padded batch can take
-            // gigabytes. See RAGSentenceEmbedder.
-            let embedder = RAGSentenceEmbedder(modelSource: embedderSource())
-            // VecturaKit would build this provider itself, at exactly this
-            // path and with these permissions; RAGKit builds it so it can wrap
-            // it and stamp host dates onto the records as they are written.
-            let storageDirectory = dbDir.appendingPathComponent(configuration.name, isDirectory: true)
-            if !FileManager.default.fileExists(atPath: storageDirectory.path) {
-                try FileManager.default.createDirectory(
-                    at: storageDirectory,
-                    withIntermediateDirectories: true,
-                    attributes: [.posixPermissions: 0o700]
-                )
-            }
-            let fileStorage = try FileStorageProvider(storageDirectory: storageDirectory, cacheEnabled: true)
-            let storage = RAGDateStampingStorage(base: fileStorage)
-
-            self.embedder = embedder
-            self.vecturaConfig = config
-            self.storage = storage
-            // Lives at the directory root (not inside VecturaKit's storage
-            // subdirectory, whose loader decodes every .json as a document),
-            // so snapshot export/import carries it with the vectors.
-            self.tagStore = RAGDocumentTagStore(
-                fileURL: dbDir.appendingPathComponent("document-tags.json")
-            )
-            self.database = try await VecturaKit(config: config, embedder: embedder, storageProvider: storage)
-            RAGLog.debug("📁 Vectura DB directory: \(dbDir.path)")
-
-            let fm = FileManager.default
-            do {
-                let contents = try fm.contentsOfDirectory(at: dbDir, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
-                let totalBytes = try contents.reduce(0 as UInt64) { acc, url in
-                    let vals = try url.resourceValues(forKeys: [.fileSizeKey])
-                    return acc &+ UInt64(vals.fileSize ?? 0)
-                }
-                let mb = Double(totalBytes) / (1024 * 1024)
-                RAGLog.debug("📊 Approx DB size: \(String(format: "%.2f", mb)) MB")
-            } catch {
-                RAGLog.warning("⚠️ Could not compute DB dir size: \(error)")
-            }
-
+            let engine = configuration.embeddingEngine
+            let embedder = try makeEmbedder(for: engine)
+            let dimension = try await vectorDimension(of: embedder, engine: engine)
+            try await open(with: embedder, dimension: dimension, forceReset: forceReset)
             RAGLog.debug("✅ Successfully initialized VecturaKit")
-
         } catch {
             RAGLog.error("❌ Failed to initialize VecturaKit: \(error)")
             throw error
+        }
+    }
+
+    /// Re-opens the database on another embedding engine, for hosts that let
+    /// the user choose one.
+    ///
+    /// An engine that embeds into a different vector space cannot answer
+    /// queries against the stored vectors, so the database is cleared:
+    /// `needsEmbedding()` then reports `true`, and a host that diffs against
+    /// `indexedDocuments()` finds every document missing and re-embeds it.
+    /// An engine in the same space keeps the vectors.
+    ///
+    /// The engine is built first, so one that cannot run on this device (Apple
+    /// languages none of which has a model) throws with the database
+    /// untouched. A failure after that (disk, storage) leaves the database
+    /// closed and still configured for the old engine, which `setUp()`
+    /// re-opens. Like `setUp` and `importSnapshot`, call it while nothing else
+    /// is using the database.
+    public func switchEmbeddingEngine(to engine: RAGEmbeddingEngine) async throws {
+        do {
+            let embedder = try makeEmbedder(for: engine)
+            let dimension = try await vectorDimension(of: embedder, engine: engine)
+            let previousSpace = self.embedder?.spaceIdentifier
+            try await open(with: embedder, dimension: dimension, forceReset: false)
+            configuration.embeddingEngine = engine
+            if embedder.spaceIdentifier != previousSpace {
+                revision += 1
+            }
+            RAGLog.debug("🔀 Embedding with \(embedder.spaceIdentifier)")
+        } catch {
+            RAGLog.error("❌ Failed to switch embedding engine: \(error)")
+            throw error
+        }
+    }
+
+    /// Opens the database directory for `embedder`: vectors from another
+    /// vector space are cleared (and a seed from one skipped) before anything
+    /// loads.
+    private func open(with embedder: any RAGEmbedder, dimension: Int, forceReset: Bool) async throws {
+        // Closed first. A failure below then leaves nothing open, rather than
+        // the previous engine's handle writing its vectors into a directory
+        // that may already be recorded as the new engine's.
+        database = nil
+        self.embedder = nil
+        vecturaConfig = nil
+        storage = nil
+        tagStore = nil
+
+        let space = RAGEmbeddingSpaceRecord(identifier: embedder.spaceIdentifier, dimension: dimension)
+        let dbDir = try prepareSeedDirectory(forceReset: forceReset, space: space)
+        self.directoryURL = dbDir
+
+        let config = try VecturaConfig(
+            name: configuration.name,
+            directoryURL: dbDir,
+            dimension: dimension
+        )
+
+        // VecturaKit would build this provider itself, at exactly this
+        // path and with these permissions; RAGKit builds it so it can wrap
+        // it and stamp host dates onto the records as they are written.
+        let storageDirectory = dbDir.appendingPathComponent(configuration.name, isDirectory: true)
+        if !FileManager.default.fileExists(atPath: storageDirectory.path) {
+            try FileManager.default.createDirectory(
+                at: storageDirectory,
+                withIntermediateDirectories: true,
+                attributes: [.posixPermissions: 0o700]
+            )
+        }
+        let fileStorage = try FileStorageProvider(storageDirectory: storageDirectory, cacheEnabled: true)
+        let storage = RAGDateStampingStorage(base: fileStorage)
+
+        self.embedder = embedder
+        self.vecturaConfig = config
+        self.storage = storage
+        // Lives at the directory root (not inside VecturaKit's storage
+        // subdirectory, whose loader decodes every .json as a document),
+        // so snapshot export/import carries it with the vectors.
+        self.tagStore = RAGDocumentTagStore(
+            fileURL: dbDir.appendingPathComponent("document-tags.json")
+        )
+        self.database = try await VecturaKit(config: config, embedder: embedder, storageProvider: storage)
+        RAGLog.debug("📁 Vectura DB directory: \(dbDir.path)")
+
+        let fm = FileManager.default
+        do {
+            let contents = try fm.contentsOfDirectory(at: dbDir, includingPropertiesForKeys: [.fileSizeKey], options: .skipsHiddenFiles)
+            let totalBytes = try contents.reduce(0 as UInt64) { acc, url in
+                let vals = try url.resourceValues(forKeys: [.fileSizeKey])
+                return acc &+ UInt64(vals.fileSize ?? 0)
+            }
+            let mb = Double(totalBytes) / (1024 * 1024)
+            RAGLog.debug("📊 Approx DB size: \(String(format: "%.2f", mb)) MB")
+        } catch {
+            RAGLog.warning("⚠️ Could not compute DB dir size: \(error)")
         }
     }
 
@@ -585,6 +652,12 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         let destSubdir = innerDir.appendingPathComponent(configuration.name, isDirectory: true)
         if fm.fileExists(atPath: storageSubdir.path) {
             try fm.copyItem(at: storageSubdir, to: destSubdir)
+            // The seed says which engine embedded it, so a host set up on
+            // another engine starts empty instead of adopting its vectors.
+            let spaceRecord = RAGEmbeddingSpaceRecord.fileURL(in: sourceDir)
+            if fm.fileExists(atPath: spaceRecord.path) {
+                try fm.copyItem(at: spaceRecord, to: RAGEmbeddingSpaceRecord.fileURL(in: innerDir))
+            }
         } else {
             // Fallback: copy the entire sourceDir contents
             try fm.copyItem(at: sourceDir, to: innerDir)
@@ -602,6 +675,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
     /// Imports a database snapshot from a `.vecturadb` directory or a ZIP
     /// archive containing one, then re-initializes the database.
+    ///
+    /// - Throws: `RAGError.embeddingSpaceMismatch`, leaving the current
+    ///   database in place, when the snapshot was embedded by a different
+    ///   engine than the configured one.
     public func importSnapshot(from snapshotURL: URL) async throws {
         let fm = FileManager.default
         let destDir = try databaseDestinationDirectory()
@@ -656,6 +733,13 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             return
         }
 
+        // Setup would clear another engine's vectors, but only after they had
+        // replaced the current database, so turn them away here instead.
+        let configuredSpace = try (embedder ?? makeEmbedder(for: configuration.embeddingEngine)).spaceIdentifier
+        if let snapshotSpace = storedSpaceIdentifier(in: sourceDir), snapshotSpace != configuredSpace {
+            throw RAGError.embeddingSpaceMismatch(snapshot: snapshotSpace, database: configuredSpace)
+        }
+
         if fm.fileExists(atPath: destDir.path) {
             try fm.removeItem(at: destDir)
         }
@@ -695,7 +779,11 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         await tagStore.setTags(updates)
     }
 
-    private func prepareSeedDirectory(forceReset: Bool = false) throws -> URL {
+    /// Prepares the database directory for vectors in `space`: the existing
+    /// database when its vectors are in that space, otherwise the bundled
+    /// seed when it is, otherwise an empty directory. Either way the space is
+    /// recorded, so the next setup can tell.
+    private func prepareSeedDirectory(forceReset: Bool = false, space: RAGEmbeddingSpaceRecord) throws -> URL {
         let fm = FileManager.default
         let destDir = try databaseDestinationDirectory()
 
@@ -712,13 +800,36 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             // subdir exists, renaming a mismatched seeded subdirectory if
             // needed.
             try ensureStorageSubdirectoryMatchesDBName(in: destDir)
-            RAGLog.debug("📦 Using existing Vectura DB at: \(destDir.path)")
-            return destDir
+            if let stored = storedSpaceIdentifier(in: destDir), stored != space.identifier {
+                // Another engine's vectors: this engine's queries would rank
+                // them as noise, or fail on the dimension. Start over, and
+                // the host re-embeds.
+                RAGLog.warning("🔀 Vectura DB holds vectors from \(stored), not \(space.identifier); clearing it")
+            } else {
+                try space.write(to: destDir)
+                RAGLog.debug("📦 Using existing Vectura DB at: \(destDir.path)")
+                return destDir
+            }
         }
 
         if fm.fileExists(atPath: destDir.path) {
             try fm.removeItem(at: destDir)
         }
+
+        try seed(destDir)
+        if let seeded = storedSpaceIdentifier(in: destDir), seeded != space.identifier {
+            RAGLog.warning("🔀 Bundled seed holds vectors from \(seeded), not \(space.identifier); starting empty")
+            try fm.removeItem(at: destDir)
+            try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
+        }
+        try space.write(to: destDir)
+        return destDir
+    }
+
+    /// Fills the (absent) database directory from the bundled seed ZIP or
+    /// folder, or creates it empty when there is no seed.
+    private func seed(_ destDir: URL) throws {
+        let fm = FileManager.default
 
         if let zipURL = configuration.bundledSeedZipURL {
             let tempUnzip = destDir.deletingLastPathComponent().appendingPathComponent("__unzipped__", isDirectory: true)
@@ -750,7 +861,7 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             try ensureStorageSubdirectoryMatchesDBName(in: destDir)
 
             RAGLog.debug("🗜️ Seeded Vectura DB from bundled zip → \(destDir.path)")
-            return destDir
+            return
         }
 
         if let folderURL = configuration.bundledSeedFolderURL {
@@ -763,7 +874,62 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             try fm.createDirectory(at: destDir, withIntermediateDirectories: true)
             RAGLog.debug("📁 Created empty Vectura DB directory (no bundled DB found) → \(destDir.path)")
         }
-        return destDir
+    }
+
+    /// The vector space `directory`'s vectors were embedded in: the one its
+    /// space record names, or, for a database written before records existed,
+    /// the sentence transformer's (the only engine there was). `nil` when the
+    /// directory holds no vectors, which any engine may adopt.
+    private func storedSpaceIdentifier(in directory: URL) -> String? {
+        if let recorded = RAGEmbeddingSpaceRecord.storedIdentifier(in: directory) {
+            return recorded
+        }
+        guard holdsVectors(directory) else { return nil }
+        return RAGSentenceEmbedder.spaceIdentifier(forModelID: configuration.remoteModelID)
+    }
+
+    /// Whether any subdirectory holds VecturaKit's per-document `.json` files,
+    /// by the same test `ensureStorageSubdirectoryMatchesDBName` uses.
+    private func holdsVectors(_ directory: URL) -> Bool {
+        let fm = FileManager.default
+        let entries = (try? fm.contentsOfDirectory(
+            at: directory,
+            includingPropertiesForKeys: [.isDirectoryKey],
+            options: [.skipsHiddenFiles]
+        )) ?? []
+        return entries.contains { entry in
+            guard (try? entry.resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true else { return false }
+            let children = (try? fm.contentsOfDirectory(atPath: entry.path)) ?? []
+            return children.contains { $0.hasSuffix(".json") }
+        }
+    }
+
+    /// Builds the engine a configuration names. Only an engine that cannot
+    /// run on this device throws, and it does so before anything on disk
+    /// changes.
+    private func makeEmbedder(for engine: RAGEmbeddingEngine) throws -> any RAGEmbedder {
+        switch engine {
+        case .sentenceTransformer:
+            // Not VecturaEmbeddingsKit's SwiftEmbedder: its GPU path leaks a
+            // compiled graph per input shape and a padded batch can take
+            // gigabytes. See RAGSentenceEmbedder. Named by the remote ID even
+            // when the bundled copy loads, so both are the same space.
+            return RAGSentenceEmbedder(modelSource: embedderSource(), modelID: configuration.remoteModelID)
+        case .naturalLanguage(let languages):
+            return try RAGNaturalLanguageEmbedder(languages: languages)
+        case .custom(let embedder):
+            return embedder
+        }
+    }
+
+    /// The engine's vector length. The sentence transformer's comes from the
+    /// configuration, so setup never loads (or downloads) the model just to
+    /// measure it; the other engines report their own.
+    private func vectorDimension(of embedder: any RAGEmbedder, engine: RAGEmbeddingEngine) async throws -> Int {
+        if case .sentenceTransformer = engine {
+            return configuration.dimension
+        }
+        return try await embedder.dimension
     }
 
     /// VecturaKit resolves its storage directory as `directoryURL / config.name`.
