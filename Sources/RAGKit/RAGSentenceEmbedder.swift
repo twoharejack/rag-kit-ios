@@ -73,7 +73,10 @@ public actor RAGSentenceEmbedder: VecturaEmbedder {
         vectors.reserveCapacity(texts.count)
         for start in stride(from: 0, to: texts.count, by: maxBatchSize) {
             let batch = Array(texts[start..<min(start + maxBatchSize, texts.count)])
-            let tensor = try model.batchEncode(batch, computePolicy: .cpuOnly)
+            // CoreML's own scope, which is all swift-embeddings' `computePolicy:`
+            // argument does, but that argument only exists from 0.0.30 and
+            // hosts on WhisperKit resolve 0.0.26. See Package.swift.
+            let tensor = try withMLTensorComputePolicy(.cpuOnly) { try model.batchEncode(batch) }
             try await vectors.append(contentsOf: Self.rows(of: tensor))
         }
         return vectors
@@ -81,7 +84,7 @@ public actor RAGSentenceEmbedder: VecturaEmbedder {
 
     public func embed(text: String) async throws -> [Float] {
         let model = try await loadedModel()
-        let tensor = try model.encode(text, computePolicy: .cpuOnly)
+        let tensor = try withMLTensorComputePolicy(.cpuOnly) { try model.encode(text) }
         return await tensor.cast(to: Float.self).shapedArray(of: Float.self).scalars
     }
 

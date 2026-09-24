@@ -20,10 +20,12 @@ let package = Package(
         // dependencies, so stay on exact 1.1.0.
         .package(url: "https://github.com/rryam/VecturaKit", revision: "e5b7cd835b7197b4278d564d134e7bf8e37a6b8c"),
         .package(url: "https://github.com/rryam/VecturaEmbeddingsKit", exact: "1.1.0"),
-        // RAGSentenceEmbedder calls swift-embeddings directly. Held exact because
-        // 0.1.0 changed the encode/batchEncode API out from under
-        // VecturaEmbeddingsKit 1.1.0.
-        .package(url: "https://github.com/jkrukowski/swift-embeddings.git", exact: "0.0.30"),
+        // RAGSentenceEmbedder calls swift-embeddings directly. Held below 0.1.0,
+        // which changed the encode/batchEncode API out from under
+        // VecturaEmbeddingsKit 1.1.0. Not held exact: 0.0.30 needs
+        // swift-transformers 1.3.3 or later, and a host on WhisperKit 0.18
+        // (swift-transformers 1.1.x) can only resolve 0.0.26.
+        .package(url: "https://github.com/jkrukowski/swift-embeddings.git", "0.0.26"..<"0.1.0"),
         .package(url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.20"),
     ],
     targets: [
