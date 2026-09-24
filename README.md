@@ -31,6 +31,13 @@ diversification.
   vector so date filtering needs no sidecar file and survives snapshot
   export/import. Hosts keep richer metadata in their own lookup keyed by the
   document ID.
+- `RAGSentenceEmbedder` — the encoder every database embeds with: a
+  BERT-family sentence-transformer (all-MiniLM-L6-v2) run on the CPU, at most
+  two texts per forward pass. It replaces VecturaEmbeddingsKit's
+  `SwiftEmbedder`, whose GPU path held every intermediate of a padded batch
+  at once (16 texts at 512 tokens peaked at 8.8 GB) and cached a compiled
+  graph for every input shape, which was never released. It produces the same
+  vectors, so existing databases and seeds stay valid.
 - `MMRDiversifier` — Maximal Marginal Relevance re-ranking with an optional
   host-supplied concept key for duplicate collapsing.
 - `EmbeddingProgressTracker` — `ObservableObject` progress for embedding UI.

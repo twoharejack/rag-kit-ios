@@ -20,10 +20,9 @@ let package = Package(
         // dependencies, so stay on exact 1.1.0.
         .package(url: "https://github.com/rryam/VecturaKit", revision: "e5b7cd835b7197b4278d564d134e7bf8e37a6b8c"),
         .package(url: "https://github.com/rryam/VecturaEmbeddingsKit", exact: "1.1.0"),
-        // Resolution constraint only (no product used directly): swift-embeddings
+        // RAGSentenceEmbedder calls swift-embeddings directly. Held exact because
         // 0.1.0 changed the encode/batchEncode API out from under
-        // VecturaEmbeddingsKit 1.1.0, so hold the transitive dependency at the
-        // version the app was already shipping.
+        // VecturaEmbeddingsKit 1.1.0.
         .package(url: "https://github.com/jkrukowski/swift-embeddings.git", exact: "0.0.30"),
         .package(url: "https://github.com/weichsel/ZIPFoundation", from: "0.9.20"),
     ],
@@ -33,6 +32,7 @@ let package = Package(
             dependencies: [
                 .product(name: "VecturaKit", package: "VecturaKit"),
                 .product(name: "VecturaEmbeddingsKit", package: "VecturaEmbeddingsKit"),
+                .product(name: "Embeddings", package: "swift-embeddings"),
                 .product(name: "ZIPFoundation", package: "ZIPFoundation"),
             ],
             // Match the host app's Swift 5 language mode.

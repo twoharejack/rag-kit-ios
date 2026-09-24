@@ -153,7 +153,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
                 dimension: configuration.dimension
             )
 
-            let embedder = SwiftEmbedder(modelSource: embedderSource())
+            // Not VecturaEmbeddingsKit's SwiftEmbedder: its GPU path leaks a
+            // compiled graph per input shape and a padded batch can take
+            // gigabytes. See RAGSentenceEmbedder.
+            let embedder = RAGSentenceEmbedder(modelSource: embedderSource())
             // VecturaKit would build this provider itself, at exactly this
             // path and with these permissions; RAGKit builds it so it can wrap
             // it and stamp host dates onto the records as they are written.
