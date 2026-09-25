@@ -109,17 +109,25 @@ rank of the right note):
 | Chinese  | 0.37                  | 0.74                    | 0.69 (`[.english, .simplifiedChinese]`) |
 | Six languages mixed | 0.85       | —                       | 0.95 |
 
-What it cannot do is cross languages: an English query found the matching
-French or Chinese note first in 0 of 7 trials with either Apple model. A text
-in a script with no block goes to the first language's block, where it is
-indexed (and keyword-searchable) but ranks poorly. Configure every language
-the corpus is written in.
+What it cannot do is cross languages: in the six-language corpus, an English
+query found the matching French or Chinese note first in 0 of 7 trials with
+either Apple model. A text in a script with no block goes to the first
+language's block, where it is indexed (and keyword-searchable) but ranks
+poorly. Configure every language the corpus is written in.
 
 Models that are not on the device are listed by `languagesNeedingDownload()`
 and fetched by `requestMissingAssets()`. Until then, texts in those languages
 fail to embed and are left out of the index, and the host's next reconcile
 picks them up. `RAGNaturalLanguageEmbedder.support(for:)` tells a settings
 screen whether a language is ready, downloadable, or unsupported.
+
+[Docs/Languages.md](Docs/Languages.md) compares the two engines language by
+language. It also covers:
+
+- choosing the language list
+- keyword search in scripts without spaces
+- how much of a long text each engine reads
+- where search cutoffs land in each language
 
 ### Scores differ by engine
 

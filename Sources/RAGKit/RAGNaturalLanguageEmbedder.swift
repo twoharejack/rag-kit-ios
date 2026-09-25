@@ -355,6 +355,10 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
             return traditional ? .traditionalChinese : .simplifiedChinese
         case "no", "nn":
             return .norwegian
+        case "pa":
+            // Apple names Punjabi by its script ("pa-Guru"); a bare "pa" has
+            // no model.
+            return .punjabi
         default:
             return NLLanguage(rawValue: code)
         }
