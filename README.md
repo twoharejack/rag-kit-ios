@@ -97,29 +97,47 @@ Apple's two embedding APIs each cover part of the problem:
 block of the vector. A text is embedded by its script's model into that
 block, and the other blocks stay zero. A query therefore only ever scores
 against documents from its own model, and a mixed English/Chinese corpus
-works. A Latin block that serves English alone uses the English
-`NLEmbedding`; every other block uses its script's `NLContextualEmbedding`.
-Measured on macOS 27 (ten notes and 24 queries per language, mean reciprocal
-rank of the right note):
+works. Every block uses its script's `NLContextualEmbedding`. The English
+`NLEmbedding` only stands in for the Latin model, in a block that serves
+English alone, while the Latin model is not on the device.
 
-| Notes in | English `NLEmbedding` | `NLContextualEmbedding` | This engine |
-|----------|-----------------------|-------------------------|-------------|
-| English  | 0.85                  | 0.75                    | 0.83 (`[.english]`) |
-| French   | 0.54                  | 0.83                    | 0.86 (`[.english, .french]`) |
-| Chinese  | 0.37                  | 0.74                    | 0.69 (`[.english, .simplifiedChinese]`) |
-| Six languages mixed | 0.85       | —                       | 0.95 |
+Each block is centered on a reference mean, and then the few directions its
+reference texts vary along most, text length first among them, are projected
+out. Without that second step every short text points the same way: a
+one-word query scored 0.6–0.8 against notes like "Okay." and under 0.1
+against the notes it was about. Measured on macOS 27, as the mean reciprocal
+rank of the right note by embedding alone (ten notes and 24 queries per
+language), except for the last row, which is mean average precision on 71
+English notes, 15 of them nearly empty, with 34 one- and two-word queries:
 
-What it cannot do is cross languages: in the six-language corpus, an English
-query found the matching French or Chinese note first in 0 of 7 trials with
-either Apple model. A text in a script with no block goes to the first
-language's block, where it is indexed (and keyword-searchable) but ranks
-poorly. Configure every language the corpus is written in.
+| Notes in | MiniLM | Apple, scheme 1 | Apple, scheme 2 (now) |
+|----------|--------|-----------------|-----------------------|
+| English  | 0.90   | 0.83 (sentence model) | 0.80 (Latin model) |
+| French   | 0.76   | 0.86            | 0.93 |
+| Chinese  | 0.49   | 0.69            | 0.81 |
+| Six languages mixed | 0.86 | 0.95  | 0.95 |
+| Each language with six nearly empty notes added | — | 0.26–0.41 (contextual), 0.83 (sentence) | 0.80–0.93 |
+| English notes, hashtag-like queries | 0.19 | 0.36 (sentence) / 0.08 (Latin) | 0.58 |
+
+Cross-language search stays weak. Within the Latin script it improved: an
+English query ranked the matching French note at 0.77 (full search) against
+0.68 before. Across scripts the cosine is exactly 0, so only a shared keyword
+can match. A text in a script with no block goes to the first language's
+block, where it is indexed (and keyword-searchable) but ranks poorly.
+Configure every language the corpus is written in.
 
 Models that are not on the device are listed by `languagesNeedingDownload()`
 and fetched by `requestMissingAssets()`. Until then, texts in those languages
 fail to embed and are left out of the index, and the host's next reconcile
-picks them up. `RAGNaturalLanguageEmbedder.support(for:)` tells a settings
+picks them up. The exception is English alone, which the sentence model
+embeds in the meantime. Its block changes model when the download lands, so
+open the database on a new engine then (`switchEmbeddingEngine(to:)`), which
+re-embeds. `RAGNaturalLanguageEmbedder.support(for:)` tells a settings
 screen whether a language is ready, downloadable, or unsupported.
+
+Working out a block's directions takes about 150 texts through the model,
+some two seconds on an M1 Max. They are kept in the Caches directory, keyed
+by the model's identity and revision, so later launches reuse them.
 
 [Docs/Languages.md](Docs/Languages.md) compares the two engines language by
 language. It also covers:
@@ -134,11 +152,13 @@ language. It also covers:
 VecturaKit's hybrid score is `0.5 × cosine + 0.5 × min(BM25 / 10, 1)`, so a
 threshold tuned for one engine does not carry over to another. Apple's
 engine centers each block (it subtracts the model's mean over fixed reference
-sentences). Raw contextual vectors all point the same way: unrelated notes
-averaged 0.70 against a query and the right one 0.74, which left a threshold
-nothing to separate. After centering, the cosine of the right note
-averaged 0.23–0.43 and of the others 0.10–0.29, depending on the language,
-and notes in another script score 0. Tune thresholds per engine.
+sentences) and takes its length directions out. Raw contextual vectors all
+point the same way: unrelated notes averaged 0.70 against a query and the
+right one 0.74, which left a threshold nothing to separate. After both
+steps, the cosine of the right note averaged 0.35–0.60 and of the others
+0.17–0.46, depending on the language, and notes in another script score 0.
+That is higher than scheme 1 scored (0.23–0.43 and 0.10–0.29), so a cutoff
+tuned on scheme 1 now lets more through. Tune thresholds per engine.
 
 ## What deliberately does not live here
 

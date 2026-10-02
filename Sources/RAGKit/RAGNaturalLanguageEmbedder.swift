@@ -5,6 +5,7 @@
 // Apple has a model for, each text embedded by the model for its script.
 // ============================================================================
 
+import Accelerate
 import Foundation
 import NaturalLanguage
 import VecturaKit
@@ -33,19 +34,23 @@ import VecturaKit
 /// it). Cross-language search does not work: an English query found the
 /// matching French or Chinese note first in 0 of 7 trials with either model.
 ///
-/// Which model each block uses, measured on macOS 27 with ten notes and 24
-/// queries per language (mean reciprocal rank of the right note):
+/// Every block uses its script's `NLContextualEmbedding`. The English
+/// `NLEmbedding` only stands in for the Latin model, in a block that serves
+/// English alone, while the Latin model is not on the device; that block moves
+/// to the Latin model (a new vector space, so a re-embed) once it is. Measured
+/// on macOS 27 with 71 English notes of every length, 15 of them nearly empty
+/// ("Okay.", "Test."), and 34 one- and two-word queries of the kind a hashtag
+/// spells (mean average precision of the notes on the query's topic that
+/// do not contain its words):
 ///
-/// | Notes in  | English NLEmbedding | NLContextualEmbedding |
-/// |-----------|---------------------|-----------------------|
-/// | English   | 0.85                | 0.75                  |
-/// | French    | 0.54                | 0.83                  |
-/// | Chinese   | 0.37                | 0.74                  |
+/// | Scheme                          | English NLEmbedding | NLContextualEmbedding |
+/// |---------------------------------|---------------------|-----------------------|
+/// | 1: centered                     | 0.36                | 0.08                  |
+/// | 2: centered, lengths taken out  | 0.40                | 0.58                  |
 ///
-/// A Latin block serving English alone therefore uses the English
-/// `NLEmbedding`, and every other block uses its script's
-/// `NLContextualEmbedding`. Adding a second Latin language (English and
-/// French, say) moves the whole Latin block to the contextual model.
+/// On the ten-note phrase-query sets the two models end level in English
+/// (mean reciprocal rank 0.93 and 0.89), and the contextual model leads in
+/// every other language measured.
 ///
 /// Pooling follows what each model is good at. The sentence model is built for
 /// sentences: given a whole note it returns a vector that says little about
@@ -62,13 +67,28 @@ import VecturaKit
 /// point the same way: unrelated English notes averaged 0.70 against a query
 /// and the right note 0.74. That leaves a search threshold nothing to
 /// separate, and it flattens the vector half of a hybrid score. Centered,
-/// unrelated notes average 0.1–0.3, and ranking moved by no more than 0.05
-/// either way.
+/// unrelated notes average 0.1–0.3.
+///
+/// Centering leaves one thing behind: a pooled vector says how long its text
+/// is more loudly than what it says. Centered on sentences, every short text
+/// points the same way, so a one-word query scored 0.6–0.8 against notes
+/// like "Okay." and "Uh." and under 0.1 against the notes it was about, and a
+/// near-empty note ranked first for 33 of the 34 queries. Each block
+/// therefore also embeds its reference sentences at five lengths (single
+/// words, pairs of words, the sentences, runs of four, all of them at once)
+/// and projects the `removedDirections` directions those spread along most,
+/// length first among them, out of every vector. With six near-empty notes
+/// added to the ten-note phrase-query sets, the contextual model's mean
+/// reciprocal rank went from 0.34–0.71 to 0.80–0.98, depending on the
+/// language. Working the directions out takes about 150 texts through the
+/// model, some two seconds on an M1 Max, so they are kept in the Caches
+/// directory and reused while the model revision and the scheme stay the
+/// same.
 ///
 /// Each block's model and revision, their order, and the pooling scheme all go
 /// into `spaceIdentifier`. A change of languages that changes the blocks (a new
-/// script, or a second Latin language) therefore re-embeds, and one that does
-/// not (reordering French and German) keeps the index.
+/// script) therefore re-embeds, and one that does not (reordering French and
+/// German) keeps the index.
 public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
     /// Whether this device can embed a language right now.
     public enum LanguageSupport: Sendable, Equatable {
@@ -81,13 +101,21 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
         case unsupported
     }
 
-    /// Bump when pooling, chunking, or the reference sentences change: any of
-    /// them moves every vector.
-    private static let schemeVersion = 1
+    /// Bump when pooling, chunking, the reference texts, or the directions
+    /// taken out change: any of them moves every vector.
+    private static let schemeVersion = 2
     private static let wordsPerRun = 10
     private static let wordLimit = 512
     private static let contextualPasses = 2
     private static let referenceSentencesPerBlock = 12
+    /// How many of the directions the reference texts spread along most are
+    /// projected out of every vector. On one-word queries anything from two to
+    /// sixteen ranked within 0.05 of five; one left most of the length signal
+    /// in (0.23 against 0.58).
+    private static let removedDirections = 5
+    /// Power-iteration steps per direction, a fixed count, so the same
+    /// reference texts always give the same directions.
+    private static let powerIterations = 300
 
     /// The configured languages this device has a model for, in the order
     /// given. The first one's block also takes texts in scripts no block
@@ -131,12 +159,19 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
         var offset = 0
         for group in groups {
             let model: Block.Model
-            if group.languages == [.english], let sentence = NLEmbedding.sentenceEmbedding(for: .english) {
+            if group.languages == [.english], !group.model.hasAvailableAssets,
+               let sentence = NLEmbedding.sentenceEmbedding(for: .english) {
                 model = .sentence(sentence)
             } else {
                 model = .contextual(group.model)
             }
-            let block = Block(routingKey: group.key, languages: group.languages, model: model, offset: offset)
+            let block = Block(
+                routingKey: group.key,
+                languages: group.languages,
+                scriptModel: group.model,
+                model: model,
+                offset: offset
+            )
             offset += block.dimension
             blocks.append(block)
         }
@@ -166,20 +201,28 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
         return .needsDownload
     }
 
-    /// Configured languages whose model has not been downloaded. Their texts
-    /// fail to embed (and are left out of the index) until it is.
+    /// Configured languages whose script model has not been downloaded. Their
+    /// texts fail to embed (and are left out of the index) until it is, with
+    /// one exception: English on its own, which the English sentence model
+    /// embeds in the meantime.
+    ///
+    /// That block changes model once the download lands, and with it the
+    /// vector space. This embedder keeps the model it was built with, so open
+    /// the database on a new one (`RAGVectorDatabase.switchEmbeddingEngine(to:)`)
+    /// to move the index over.
     public func languagesNeedingDownload() -> [NLLanguage] {
-        blocks.filter(\.needsAssets).flatMap(\.languages)
+        blocks.filter(\.awaitsScriptModel).flatMap(\.languages)
     }
 
-    /// Asks the system to download every model this embedder needs and does
-    /// not have. The download is Apple's, not the app's.
+    /// Asks the system to download every script model this embedder's
+    /// languages need and the device does not have. The download is Apple's,
+    /// not the app's.
     /// - Returns: Whether every model is available afterwards.
     @discardableResult
     public func requestMissingAssets() async -> Bool {
         var allAvailable = true
-        for index in blocks.indices where blocks[index].needsAssets {
-            guard case .contextual(let model) = blocks[index].model else { continue }
+        for index in blocks.indices where blocks[index].awaitsScriptModel {
+            let model = blocks[index].scriptModel
             do {
                 let result = try await model.requestAssets()
                 allAvailable = allAvailable && result == .available
@@ -212,8 +255,9 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
 
     // MARK: - Embedding
 
-    /// The text's vector: its block holds the centered, pooled embedding from
-    /// the block's model, and every other block is zero.
+    /// The text's vector: its block holds the pooled embedding from the
+    /// block's model, centered and with the block's length directions taken
+    /// out, and every other block is zero.
     private func vector(for text: String) throws -> [Float] {
         let (index, language) = route(text)
         try prepareBlock(at: index)
@@ -221,9 +265,10 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
         guard let pooled = try pooledVector(of: text, in: block, language: language) else {
             throw VecturaError.invalidInput("Apple's embedding model returned no vector for text of length \(text.count)")
         }
+        let adjusted = Self.removing(block.directions, from: Self.subtracting(block.center, from: pooled))
         var vector = [Float](repeating: 0, count: dimension)
         for component in 0..<block.dimension {
-            vector[block.offset + component] = Float(pooled[component] - (block.center?[component] ?? 0))
+            vector[block.offset + component] = Float(adjusted[component])
         }
         return vector
     }
@@ -251,7 +296,12 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
         return key
     }
 
-    /// Loads the block's model and computes its center, once.
+    /// Loads the block's model and works out, once, what comes off every
+    /// vector in it: the reference sentences' mean, and the directions the
+    /// reference texts at every length spread along most. Those take about
+    /// 150 texts through the model, a few seconds, so they are kept on disk
+    /// (`Preparation`) and worked out again only for a new model revision or
+    /// scheme.
     private func prepareBlock(at index: Int) throws {
         guard blocks[index].center == nil else { return }
         if case .contextual(let model) = blocks[index].model {
@@ -260,11 +310,96 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
             }
             try model.load()
         }
-        let reference = Self.referenceSentences(for: blocks[index])
-        let vectors = try reference.compactMap { try pooledVector(of: $0.text, in: blocks[index], language: $0.language) }
-        blocks[index].center = vectors.isEmpty
-            ? [Double](repeating: 0, count: blocks[index].dimension)
-            : Self.mean(of: vectors, dimension: blocks[index].dimension)
+        let block = blocks[index]
+        let preparation: Preparation
+        if let stored = Preparation.stored(for: block) {
+            preparation = stored
+        } else {
+            preparation = try prepare(block)
+            preparation.store(for: block)
+        }
+        blocks[index].center = preparation.center
+        blocks[index].directions = preparation.directions
+    }
+
+    private func prepare(_ block: Block) throws -> Preparation {
+        let sentences = Self.referenceSentences(for: block)
+        let sentenceVectors = try sentences.compactMap { try pooledVector(of: $0.text, in: block, language: $0.language) }
+        let center = sentenceVectors.isEmpty
+            ? [Double](repeating: 0, count: block.dimension)
+            : Self.mean(of: sentenceVectors, dimension: block.dimension)
+
+        var centered = sentenceVectors.map { Self.subtracting(center, from: $0) }
+        for reference in referenceTexts(around: sentences) {
+            guard let pooled = try pooledVector(of: reference.text, in: block, language: reference.language) else { continue }
+            centered.append(Self.subtracting(center, from: pooled))
+        }
+        return Preparation(center: center, directions: Self.strongestDirections(of: centered, count: Self.removedDirections))
+    }
+
+    /// The reference sentences at the other lengths, so that length is the
+    /// strongest thing the references vary by: every word on its own, the
+    /// words two at a time, runs of four sentences, and all of them together.
+    private func referenceTexts(around sentences: [(language: NLLanguage, text: String)]) -> [(language: NLLanguage, text: String)] {
+        guard !sentences.isEmpty else { return [] }
+        var texts: [(language: NLLanguage, text: String)] = []
+        for sentence in sentences {
+            let words = wordRanges(in: sentence.text, language: sentence.language)
+            texts += words.map { (sentence.language, String(sentence.text[$0])) }
+            texts += stride(from: 0, to: words.count - 1, by: 2).map { first in
+                (sentence.language, String(sentence.text[words[first].lowerBound..<words[first + 1].upperBound]))
+            }
+        }
+
+        func joined(_ group: [(language: NLLanguage, text: String)]) -> (language: NLLanguage, text: String) {
+            let separator = Self.unspacedLanguages.contains(group[0].language) ? "" : " "
+            return (group[0].language, group.map(\.text).joined(separator: separator))
+        }
+        let count = sentences.count
+        texts += (0..<count).map { first in joined((0..<min(4, count)).map { sentences[(first + $0) % count] }) }
+        texts.append(joined(sentences))
+        return texts
+    }
+
+    /// Languages written without spaces between sentences.
+    private static let unspacedLanguages: Set<NLLanguage> = [.simplifiedChinese, .traditionalChinese, .japanese, .thai]
+
+    /// A block's center and directions. They depend only on the block's model
+    /// (its kind, identity and revision) and on this scheme, both in the file
+    /// name, so a stored copy is as good as working them out again. The
+    /// system may empty the Caches directory; they are then worked out again,
+    /// to the same numbers.
+    private struct Preparation: Codable {
+        let center: [Double]
+        let directions: [[Double]]
+
+        static func stored(for block: Block) -> Preparation? {
+            guard let url = fileURL(for: block),
+                  let data = try? Data(contentsOf: url),
+                  let stored = try? PropertyListDecoder().decode(Preparation.self, from: data),
+                  stored.center.count == block.dimension,
+                  stored.directions.allSatisfy({ $0.count == block.dimension })
+            else { return nil }
+            return stored
+        }
+
+        func store(for block: Block) {
+            guard let url = Self.fileURL(for: block) else { return }
+            do {
+                try FileManager.default.createDirectory(at: url.deletingLastPathComponent(), withIntermediateDirectories: true)
+                let encoder = PropertyListEncoder()
+                encoder.outputFormat = .binary
+                try encoder.encode(self).write(to: url, options: .atomic)
+            } catch {
+                RAGLog.warning("⚠️ Could not keep the \(block.spaceComponent) block's centering on disk: \(error)")
+            }
+        }
+
+        private static func fileURL(for block: Block) -> URL? {
+            FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask).first?
+                .appendingPathComponent("RAGKit/NaturalLanguage", isDirectory: true)
+                .appendingPathComponent("apple-nl-v\(RAGNaturalLanguageEmbedder.schemeVersion)-\(block.spaceComponent).plist")
+        }
     }
 
     private func pooledVector(of text: String, in block: Block, language: NLLanguage?) throws -> [Double]? {
@@ -285,13 +420,7 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
     /// including in scripts that put no spaces between words. Text with no
     /// words in it at all (emoji, symbols) is one run.
     private func runs(of text: String, language: NLLanguage?) -> [String] {
-        tokenizer.string = text
-        tokenizer.setLanguage(language ?? .english)
-        var words: [Range<String.Index>] = []
-        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
-            words.append(range)
-            return words.count < Self.wordLimit
-        }
+        let words = wordRanges(in: text, language: language)
         guard !words.isEmpty else {
             let trimmed = text.trimmingCharacters(in: .whitespacesAndNewlines)
             return trimmed.isEmpty ? [] : [trimmed]
@@ -300,6 +429,18 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
             let last = min(first + Self.wordsPerRun, words.count) - 1
             return String(text[words[first].lowerBound..<words[last].upperBound])
         }
+    }
+
+    /// The first `wordLimit` words of `text`.
+    private func wordRanges(in text: String, language: NLLanguage?) -> [Range<String.Index>] {
+        tokenizer.string = text
+        tokenizer.setLanguage(language ?? .english)
+        var words: [Range<String.Index>] = []
+        tokenizer.enumerateTokens(in: text.startIndex..<text.endIndex) { range, _ in
+            words.append(range)
+            return words.count < Self.wordLimit
+        }
+        return words
     }
 
     /// The mean of the model's token vectors over the text. The model reads
@@ -338,6 +479,78 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
             }
         }
         return sum.map { $0 / Double(vectors.count) }
+    }
+
+    private static func subtracting(_ center: [Double]?, from vector: [Double]) -> [Double] {
+        guard let center else { return vector }
+        return zip(vector, center).map { $0 - $1 }
+    }
+
+    /// `vector` with its component along each of `directions` (unit vectors,
+    /// orthogonal to each other) taken out.
+    private static func removing(_ directions: [[Double]], from vector: [Double]) -> [Double] {
+        var vector = vector
+        for direction in directions {
+            var projection = 0.0
+            vDSP_dotprD(vector, 1, direction, 1, &projection, vDSP_Length(vector.count))
+            for component in vector.indices {
+                vector[component] -= projection * direction[component]
+            }
+        }
+        return vector
+    }
+
+    /// The `count` directions `vectors` spread along most, strongest first,
+    /// as orthonormal unit vectors: the leading eigenvectors of their scatter
+    /// matrix about the origin (the vectors come already centered).
+    ///
+    /// Found through the Gram matrix, which is only as wide as there are
+    /// vectors, by power iteration with deflation. The start vectors and the
+    /// number of steps are fixed, so the same references always give the same
+    /// directions.
+    private static func strongestDirections(of vectors: [[Double]], count: Int) -> [[Double]] {
+        let rows = vectors.count
+        guard rows > 0, count > 0 else { return [] }
+        let dimension = vectors[0].count
+        let data = vectors.flatMap { $0 }
+        var transposed = [Double](repeating: 0, count: data.count)
+        vDSP_mtransD(data, 1, &transposed, 1, vDSP_Length(dimension), vDSP_Length(rows))
+        var gram = [Double](repeating: 0, count: rows * rows)
+        vDSP_mmulD(data, 1, transposed, 1, &gram, 1, vDSP_Length(rows), vDSP_Length(rows), vDSP_Length(dimension))
+
+        var directions: [[Double]] = []
+        for index in 0..<min(count, rows) {
+            var weights = (0..<rows).map { sin(Double($0 * (index + 3) + 1)) }
+            var next = [Double](repeating: 0, count: rows)
+            for _ in 0..<powerIterations {
+                vDSP_mmulD(gram, 1, weights, 1, &next, 1, vDSP_Length(rows), 1, vDSP_Length(rows))
+                var norm = 0.0
+                vDSP_svesqD(next, 1, &norm, vDSP_Length(rows))
+                norm = norm.squareRoot()
+                guard norm > 1e-12 else { return directions }
+                var scale = 1 / norm
+                vDSP_vsmulD(next, 1, &scale, &weights, 1, vDSP_Length(rows))
+            }
+            // The eigenvalue, then the direction in the vectors' own space.
+            vDSP_mmulD(gram, 1, weights, 1, &next, 1, vDSP_Length(rows), 1, vDSP_Length(rows))
+            var eigenvalue = 0.0
+            vDSP_dotprD(weights, 1, next, 1, &eigenvalue, vDSP_Length(rows))
+            guard eigenvalue > 1e-12 else { return directions }
+            var direction = [Double](repeating: 0, count: dimension)
+            vDSP_mmulD(transposed, 1, weights, 1, &direction, 1, vDSP_Length(dimension), 1, vDSP_Length(rows))
+            var length = 0.0
+            vDSP_svesqD(direction, 1, &length, vDSP_Length(dimension))
+            length = length.squareRoot()
+            guard length > 1e-12 else { return directions }
+            directions.append(direction.map { $0 / length })
+            // Deflate: the next power iteration finds the next direction.
+            for row in 0..<rows {
+                for column in 0..<rows {
+                    gram[row * rows + column] -= eigenvalue * weights[row] * weights[column]
+                }
+            }
+        }
+        return directions
     }
 
     // MARK: - Languages
@@ -447,9 +660,11 @@ public actor RAGNaturalLanguageEmbedder: RAGEmbedder {
 // MARK: - Block
 
 /// One script's slice of the vector: which model fills it, where it sits,
-/// and the center subtracted from it.
+/// and what is taken off every vector in it.
 private struct Block {
     enum Model {
+        /// The English sentence model, standing in for the Latin contextual
+        /// model while the device does not have it.
         case sentence(NLEmbedding)
         case contextual(NLContextualEmbedding)
     }
@@ -458,15 +673,21 @@ private struct Block {
     /// texts are routed by (a sentence block keeps its script's key).
     let routingKey: String
     let languages: [NLLanguage]
+    /// The script's contextual model, whether or not it is the one in use:
+    /// the one a download fetches.
+    let scriptModel: NLContextualEmbedding
     let model: Model
     let offset: Int
     /// Computed on first use, from `RAGNaturalLanguageEmbedder`'s reference
-    /// sentences.
+    /// sentences: their mean, and the directions they spread along most at
+    /// every length, both subtracted from every vector.
     var center: [Double]?
+    var directions: [[Double]] = []
 
-    init(routingKey: String, languages: [NLLanguage], model: Model, offset: Int) {
+    init(routingKey: String, languages: [NLLanguage], scriptModel: NLContextualEmbedding, model: Model, offset: Int) {
         self.routingKey = routingKey
         self.languages = languages
+        self.scriptModel = scriptModel
         self.model = model
         self.offset = offset
     }
@@ -478,9 +699,11 @@ private struct Block {
         }
     }
 
-    var needsAssets: Bool {
-        guard case .contextual(let model) = model else { return false }
-        return !model.hasAvailableAssets
+    /// Whether the script's model still has to be downloaded: before this
+    /// block can embed at all, or, for a block the sentence model stands in
+    /// for, before it can move to the better model.
+    var awaitsScriptModel: Bool {
+        !scriptModel.hasAvailableAssets
     }
 
     /// Languages the model itself knows, which pick its reference sentences

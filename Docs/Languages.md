@@ -21,9 +21,9 @@ reciprocal rank (MRR) of the right note:
 
 | The corpus is in | Use | Why |
 |---|---|---|
-| English only | Either | MiniLM 0.94 against Apple's 0.92, a gap within noise. Apple's needs no 90 MB download. |
-| Another Latin-script language (French, German, Spanish, …) | Apple | Ties or beats MiniLM, and leads on the embedding alone: 0.86 vs 0.76 in French. |
-| Chinese, Japanese, Korean | Apple | 0.73–0.83 against MiniLM's 0.51–0.69. MiniLM's vocabulary lacks most Chinese characters. |
+| English only | Either; Apple for one-word queries | MiniLM 0.94 against Apple's 0.89 on phrase queries. On one-word queries over notes that include nearly empty ones, Apple 0.58 against MiniLM's 0.19 (see [One-word queries and nearly empty notes](#one-word-queries-and-nearly-empty-notes)). Apple's needs no 90 MB download. |
+| Another Latin-script language (French, German, Spanish, …) | Apple | Beats MiniLM (0.95 vs 0.92 in French, 0.93 vs 0.82 in German), and leads on the embedding alone: 0.93 vs 0.76 in French. |
+| Chinese, Japanese, Korean | Apple | 0.81–0.88 against MiniLM's 0.51–0.69. MiniLM's vocabulary lacks most Chinese characters. |
 | Russian, Arabic, Hindi, Thai, or another language on Apple's list | Apple, once the model is downloaded | Apple's side was not measured (models not installed). MiniLM's embedding alone scored 0.29–0.49 on these languages (chance is 0.29), and its full search scored 0.35 in Thai. |
 | Several languages | Apple, with every language listed | 1.00 against MiniLM's 0.93 on a six-language set. |
 | Queries in one language for notes in another | Neither | See [Cross-language search](#cross-language-search). |
@@ -50,11 +50,13 @@ as unknown tokens. Measured on the test notes:
 ### Apple
 
 Apple has one contextual model (`NLContextualEmbedding`) per script, plus an
-English sentence model (`NLEmbedding`). RAGKit uses them as follows:
+English sentence model (`NLEmbedding`). RAGKit uses the contextual models,
+and the English sentence model only in their place (see
+[English alone, before the Latin model arrives](#english-alone-before-the-latin-model-arrives)):
 
 | Model | Languages | On the test Mac |
 |---|---|---|
-| English sentence model | English | Installed |
+| English sentence model (stand-in) | English | Installed |
 | Latin | Croatian, Czech, Danish, Dutch, English, Finnish, French, German, Hungarian, Indonesian, Italian, Norwegian Bokmål, Polish, Portuguese, Romanian, Slovak, Spanish, Swedish, Turkish, Vietnamese | Installed |
 | Chinese, Japanese, Korean | Chinese (Simplified, Traditional), Japanese, Korean | Installed |
 | Cyrillic | Bulgarian, Kazakh, Russian, Ukrainian | Needs a download |
@@ -86,18 +88,18 @@ engine was tested on these languages.
 Ten notes and 24 queries per language, with queries in the notes' language.
 Each cell is the MRR of the full hybrid search, with the embedding's
 score alone in parentheses. Apple's engine was configured with that language
-alone, so English used the English sentence model. The mixed row lists all
-six languages.
+alone, so English used the Latin model. The mixed row lists all six
+languages.
 
 | Language | MiniLM | Apple | Right note had a keyword match |
 |---|---|---|---|
-| English | 0.94 (0.90) | 0.92 (0.83) | 75% |
-| French | 0.92 (0.76) | 0.92 (0.86) | 67% |
-| German | 0.82 (0.69) | 0.86 (0.72) | 54% |
-| Spanish | 0.80 (0.62) | 0.86 (0.67) | 58% |
-| Chinese (Simplified) | 0.51 (0.49) | 0.73 (0.69) | 8% |
-| Japanese | 0.62 (0.60) | 0.80 (0.75) | 8% |
-| Korean | 0.69 (0.32) | 0.83 (0.69) | 58% |
+| English | 0.94 (0.90) | 0.89 (0.80) | 75% |
+| French | 0.92 (0.76) | 0.95 (0.93) | 67% |
+| German | 0.82 (0.69) | 0.93 (0.85) | 54% |
+| Spanish | 0.80 (0.62) | 0.87 (0.82) | 58% |
+| Chinese (Simplified) | 0.51 (0.49) | 0.81 (0.81) | 8% |
+| Japanese | 0.62 (0.60) | 0.88 (0.86) | 8% |
+| Korean | 0.69 (0.32) | 0.86 (0.82) | 58% |
 | Russian | 0.75 (0.49) | Not installed | 58% |
 | Arabic | 0.77 (0.29) | Not installed | 71% |
 | Hindi | 0.75 (0.45) | Not installed | 58% |
@@ -108,7 +110,7 @@ How to read the table:
 
 - **Share of queries answered first:**
   - MiniLM: 88% (English), 38% (Chinese), 17% (Thai).
-  - Apple: 83% (English), 58% (Chinese), 67% (Japanese), and every query
+  - Apple: 79% (English), 67% (Chinese), 75% (Japanese), and every query
     in the mixed set.
 - **MiniLM leans on keywords outside English.** In Korean, Russian, Arabic
   and Hindi its embedding alone scored 0.29–0.49, and word matches lifted
@@ -120,8 +122,8 @@ How to read the table:
 
 ```swift
 .naturalLanguage(languages: [])                             // the device's preferred languages
-.naturalLanguage(languages: [.english])                     // the English sentence model
-.naturalLanguage(languages: [.english, .french])            // one Latin block, contextual model
+.naturalLanguage(languages: [.english])                     // one Latin block (the sentence model until it arrives)
+.naturalLanguage(languages: [.english, .french])            // the same Latin block
 .naturalLanguage(languages: [.english, .simplifiedChinese]) // a Latin and a CJK block: 1,024 dimensions
 ```
 
@@ -132,25 +134,35 @@ embedded into its script's block, and every other block stays zero.
 
 Texts are routed by script model, not by exact language:
 
-- Japanese notes scored the same (0.80) with `[.english, .simplifiedChinese]`
+- Japanese notes scored the same (0.88) with `[.english, .simplifiedChinese]`
   as with `[.japanese]`.
-- German notes scored the same (0.86) with `[.english, .french]` as with
-  `[.german]`.
+- German notes scored the same (0.93) with `[.english, .french]` and with
+  `[.english]` as with `[.german]`.
 
-### English alone is the exception
+### English alone, before the Latin model arrives
 
-A Latin block that serves only English uses the English sentence model. It is
-the better of Apple's two models for English, and weaker for any other
-Latin-script text that turns up:
+A Latin block that serves only English uses the English sentence model while
+the Latin model is not on the device, so English search works before any
+download. It is a stand-in. The Latin model ranks one-word queries far
+better (0.58 against 0.40, see
+[One-word queries and nearly empty notes](#one-word-queries-and-nearly-empty-notes)),
+and it reads the other Latin-script languages, which the sentence model
+does not:
 
-| Notes | `[.english]` | `[.english, .french]` |
+| Notes | `[.english]`, sentence model | `[.english]` or `[.english, .french]`, Latin model |
 |---|---|---|
-| English | 0.92 (0.83) | 0.86 (0.77) |
-| French | 0.84 (0.55) | 0.92 (0.86) |
-| German | 0.66 (0.42) | 0.86 (0.72) |
+| English | 0.93 (0.86) | 0.89 (0.80) |
+| French | 0.84 (0.57) | 0.95 (0.93) |
+| German | 0.66 (0.39) | 0.93 (0.85) |
 
-If the corpus may hold other Latin-script languages, list at least one of
-them.
+While the sentence model stands in, `languagesNeedingDownload()` lists
+English and `requestMissingAssets()` fetches the Latin model. The block then
+changes model, which is a new vector space: build a new engine and call
+`switchEmbeddingEngine(to:)`, and the database clears itself for a re-embed.
+
+Scheme 1 used the sentence model for English alone whenever it was there. It
+scored 0.92 (0.83) on English phrase queries, level with the Latin model
+now, but 0.36 on one-word queries.
 
 ### Unlisted scripts go to the first block
 
@@ -158,8 +170,8 @@ Texts in a script with no block are still indexed and keyword-searchable,
 but they are embedded by the first block's model, which does not read their
 script:
 
-- Chinese notes under `[.english]`: 0.44 (0.37)
-- Russian notes under `[.english]`: 0.67, mostly from keywords (0.39)
+- Chinese notes under `[.english]`: 0.34 (0.27)
+- Russian notes under `[.english]`: 0.63, mostly from keywords (0.27)
 
 Put the corpus's main language first, and list every script the corpus uses.
 
@@ -168,12 +180,14 @@ Put the corpus's main language first, and list every script the corpus uses.
 `spaceIdentifier` names the blocks' models and their order:
 
 - **Same blocks, same index.** Reordering languages that share one block
-  (French and German) keeps it.
+  (French and German), or adding French to English, keeps it.
 - **Different blocks, re-embed.** Any of these means a new vector space:
   - adding or removing a block
   - reordering blocks
-  - changing a block's model (English alone, then English plus another
-    Latin-script language)
+  - changing a block's model (English alone moving from the sentence model
+    to the Latin model)
+  - a new model revision, or a new scheme in RAGKit (scheme 2 took length
+    out of the vectors)
 
   The database clears itself, and the host re-embeds its corpus.
 
@@ -198,6 +212,10 @@ space does not change when the download finishes. Until then:
 - **Downloading.** `languagesNeedingDownload()` lists those languages.
   `requestMissingAssets()` asks the system to download their models; the
   download is Apple's, not the app's.
+
+English alone is the exception: the sentence model embeds it until the Latin
+model arrives (see
+[English alone, before the Latin model arrives](#english-alone-before-the-latin-model-arrives)).
 
 ### Device languages
 
@@ -271,26 +289,31 @@ uses. Each query has 9 wrong notes.
 
 | Language | Apple: median score, right / wrong note | Apple at 0.12: right notes kept, wrong notes let through | MiniLM: median score, right / wrong note | MiniLM at 0.25: right notes kept, wrong notes let through |
 |---|---|---|---|---|
-| English | 0.30 / 0.13 | 100%, 5.0 | 0.47 / 0.31 | 100%, 8.8 |
-| French | 0.30 / 0.15 | 100%, 6.2 | 0.46 / 0.34 | 100%, 9.0 |
-| German | 0.20 / 0.09 | 62%, 3.7 | 0.42 / 0.35 | 100%, 9.0 |
-| Spanish | 0.27 / 0.15 | 88%, 5.5 | 0.45 / 0.36 | 100%, 9.0 |
-| Chinese | 0.15 / 0.05 | 54%, 2.0 | 0.38 / 0.36 | 100%, 9.0 |
-| Japanese | 0.11 / 0.01 | 38%, 1.1 | 0.36 / 0.32 | 100%, 8.9 |
-| Korean | 0.15 / 0.04 | 58%, 1.5 | 0.49 / 0.41 | 100%, 9.0 |
-| Six languages mixed | 0.31 / 0.00 | 90%, 0.8 | 0.51 / 0.32 | 100%, 8.9 |
+| English | 0.34 / 0.16 | 100%, 7.1 | 0.47 / 0.31 | 100%, 8.8 |
+| French | 0.38 / 0.23 | 100%, 8.7 | 0.46 / 0.34 | 100%, 9.0 |
+| German | 0.31 / 0.18 | 100%, 6.9 | 0.42 / 0.35 | 100%, 9.0 |
+| Spanish | 0.31 / 0.17 | 100%, 6.7 | 0.45 / 0.36 | 100%, 9.0 |
+| Chinese | 0.21 / 0.09 | 92%, 3.4 | 0.38 / 0.36 | 100%, 9.0 |
+| Japanese | 0.20 / 0.08 | 83%, 2.3 | 0.36 / 0.32 | 100%, 8.9 |
+| Korean | 0.25 / 0.13 | 96%, 4.9 | 0.49 / 0.41 | 100%, 9.0 |
+| Six languages mixed | 0.40 / 0.02 | 100%, 1.2 | 0.51 / 0.32 | 100%, 8.9 |
 
 ### Apple
 
 One cutoff cannot fit every language:
 
-- **English and French.** 0.12 keeps every right note.
-- **Chinese, Japanese and Korean.** 0.12 drops about half of the right notes.
-  These notes get no keyword share, and the CJK model's centered cosines run
-  lower: 0.16–0.23 for the right note, against 0.30–0.43 in Latin-script
-  languages.
+- **Latin-script languages.** 0.12 keeps every right note and lets most
+  wrong ones through (6.7–8.7 of 9). A cutoff that keeps 90% of the right
+  notes sits at 0.20–0.27 and lets 18–25% of the wrong ones through.
+- **Chinese, Japanese and Korean.** 0.12 keeps 83–96% of the right notes
+  (38–58% with scheme 1). These notes get no keyword share, and the CJK
+  model's cosines run lower: 0.35–0.39 for the right note, against 0.47–0.60
+  in Latin-script languages.
 - **Mixed scripts.** A corpus in several scripts is cleaner, because a note
   in another script has an embedding score of exactly 0.
+
+Scheme 2 scores higher than scheme 1 did (the English medians were 0.30 and
+0.13), so a cutoff tuned on scheme 1 now lets more through.
 
 Use a cutoff per script, or rank only and cap the number of results.
 
@@ -322,8 +345,8 @@ Each engine reads only the start of a long text:
 | Russian, Arabic | ≈ 620 | Not installed |
 | Hindi | ≈ 870 | Not installed |
 
-A block using the English sentence model reads the first 512 words instead,
-about 3,000 characters of English. The estimates come from tokens per
+The English sentence model, while it stands in, reads the first 512 words
+instead, about 3,000 characters of English. The estimates come from tokens per
 character on the test notes.
 
 In Chinese, Japanese and Korean, only the first few hundred characters count.
@@ -336,14 +359,14 @@ another.
 
 | English queries, notes in | MiniLM | Apple, `[.english, <language>]` |
 |---|---|---|
-| French | 0.63 | 0.68 |
-| German | 0.62 | 0.68 |
-| Spanish | 0.58 | 0.61 |
+| French | 0.63 | 0.77 |
+| German | 0.62 | 0.76 |
+| Spanish | 0.58 | 0.73 |
 | Chinese | 0.46 | 0.29 |
 | Japanese | 0.53 | 0.29 |
 | Korean | 0.31 | 0.29 |
 | Russian, Arabic, Hindi, Thai | 0.28–0.41 | Not installed |
-| Six languages mixed: 7 English queries for non-English notes | 0.57 | 0.18 |
+| Six languages mixed: 7 English queries for non-English notes | 0.57 | 0.23 |
 
 ### Apple, another script
 
@@ -352,11 +375,13 @@ as a name or "ATP", can match. 0.29 is chance.
 
 ### Apple, the same script
 
-The Latin model does place an English query near the matching French note:
-the right note came first 54% of the time when every note was French. But the
-scores are tiny (median 0.04, so only 12% passed 0.12), and notes in the
-query's own language tend to outrank it. In the mixed set, 0 of 7 English
-queries ranked their note first, an MRR of 0.18, below chance.
+The Latin model places an English query near the matching French note: the
+right note came first 67% of the time when every note was French (54% with
+scheme 1), with a median score of 0.14, so 62% passed 0.12 (12% before). The
+Latin reference sentences are in eleven languages, so what tells those
+languages apart is probably among the directions scheme 2 takes out. Notes in
+the query's own language still tend to outrank it: in the mixed set, 0 of 7
+English queries ranked their note first, an MRR of 0.23, below chance.
 
 ### MiniLM
 
@@ -368,6 +393,46 @@ queries over French notes), and very little else.
 
 If cross-language search matters, bring a multilingual model through
 `.custom(_:)`, or index a translation beside each text.
+
+## One-word queries and nearly empty notes
+
+Hosts often search with a word or two, such as a hashtag's name, and real
+corpora collect nearly empty texts: a test recording, "Okay.", speech
+recognition's guesses at silence. Measured with 71 English notes (14 topics,
+each as a page, a paragraph, a sentence and a three-word note, plus 15 nearly
+empty notes) and 34 one- and two-word queries named after the topics. A
+query's notes that contain its words were set aside, as a host that lists
+keyword matches separately would, and the rest were ranked by the full
+hybrid search. Note to note, each topic note was the query and the other
+notes on its topic the answers.
+
+| Engine | Mean average precision | Nearly empty note ranked first | At the cutoff, kept: topic notes / others / nearly empty | Note to note |
+|---|---|---|---|---|
+| MiniLM (0.25) | 0.19 | 24 of 34 | 100% / 99% / 100% | 0.23 |
+| Apple scheme 1, Latin model (0.12) | 0.08 | 33 of 34 | 40% / 29% / 99% | 0.25 |
+| Apple scheme 1, English sentence model (0.12) | 0.36 | 3 of 34 | 57% / 21% / 11% | 0.26 |
+| Apple scheme 2, Latin model (0.12) | 0.58 | 3 of 34 | 84% / 46% / 17% | 0.34 |
+| Apple scheme 2, English sentence model (0.12) | 0.40 | 4 of 34 | 40% / 7% / 2% | 0.27 |
+
+**Why scheme 1 failed.** Mean-pooled contextual vectors carry a text's
+length more strongly than its meaning. Centered on sentences, every short
+text points the same way, so a one-word query scored 0.6–0.8 against the
+nearly empty notes and under 0.1 against the pages about its topic. The
+sentence model leaned the same way more gently: three-word notes such as
+"Buy school shoes." turned up for most queries.
+
+**What scheme 2 does.** Each block also embeds its reference sentences at
+five lengths (single words, pairs of words, the sentences, runs of four,
+all together) and projects out the five directions those texts vary along
+most. On the phrase-query sets with six nearly empty notes added in the
+notes' own language, the contextual model's MRR went from 0.34–0.71 to
+0.80–0.98, and a nearly empty note outranked the right one for 0–8% of
+queries instead of 38–71%. Fewer reference texts did worse: with one word
+per sentence and no pairs, the one-word queries scored 0.47.
+
+**MiniLM.** First-token pooling crowds short texts too: the nearly empty
+notes scored a median of 0.38 against 0.36 for the notes on the query's
+topic, and a cutoff of 0.25 removes almost nothing.
 
 ## Short queries and language detection
 
@@ -385,7 +450,9 @@ same block. Only the language hint passed to the model changes.
 ## How this was measured
 
 - **Setup.** Run on 2026-09-24 with macOS 27.0 on an M1 Max, RAGKit 6bb12d8
-  and VecturaKit e5b7cd8.
+  and VecturaKit e5b7cd8. Apple's numbers were run again on 2026-09-25 with
+  scheme 2, which takes length out of the vectors; "scheme 1" marks the
+  earlier ones.
 - **Corpus.**
   - Ten everyday notes, each a title, hashtags and 3–5 sentences
     (200–450 characters in English).
@@ -400,7 +467,12 @@ same block. Only the language hint passed to the model changes.
   ranks by cosine.
 - **Apple.** The shipped `RAGNaturalLanguageEmbedder`. The Cyrillic, Arabic,
   Indic and Thai models were not installed and were not downloaded for the
-  test.
+  test, so scheme 2 is unmeasured in those scripts. Their blocks have six to
+  eight reference sentences instead of twelve. Cut to six, the measured
+  scripts still kept nearly empty notes down (0–12% of queries), at some
+  cost in ranking (Chinese 0.75 against 0.81). The sentence
+  model's stand-in numbers come from the same file with its asset check
+  forced.
 - **MiniLM.** The all-MiniLM-L6-v2 file the app downloads, run in PyTorch with
   RAGKit's pooling (first token, 512-token cap) and Hugging Face's tokenizer.
   The app tokenizes with swift-transformers, which normalizes text the same
