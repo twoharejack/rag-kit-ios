@@ -40,6 +40,13 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
     /// Remote model repository ID used when no valid local model folder exists.
     /// It also names the sentence transformer's vector space.
     public var remoteModelID: String
+    /// How the sentence transformer pools a text's token vectors (see
+    /// `RAGSentenceEmbedder.Pooling`). `.firstToken`, the default, keeps the
+    /// vectors every database and seed was embedded with until now; `.mean`
+    /// is what sentence-transformers models are trained for and ranks far
+    /// better, in a vector space of its own, so a database switched to it is
+    /// cleared and re-embedded and a first-token seed is skipped.
+    public var sentenceTransformerPooling: RAGSentenceEmbedder.Pooling
     /// The engine documents and queries are embedded with. The model fields
     /// above only matter for `.sentenceTransformer`, the default.
     ///
@@ -59,7 +66,8 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
         localModelFolderURL: URL? = nil,
         requiredLocalModelFiles: [String] = [],
         remoteModelID: String,
-        embeddingEngine: RAGEmbeddingEngine = .sentenceTransformer
+        embeddingEngine: RAGEmbeddingEngine = .sentenceTransformer,
+        sentenceTransformerPooling: RAGSentenceEmbedder.Pooling = .firstToken
     ) {
         self.name = name
         self.dimension = dimension
@@ -71,6 +79,7 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
         self.requiredLocalModelFiles = requiredLocalModelFiles
         self.remoteModelID = remoteModelID
         self.embeddingEngine = embeddingEngine
+        self.sentenceTransformerPooling = sentenceTransformerPooling
     }
 }
 
@@ -914,7 +923,11 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             // compiled graph per input shape and a padded batch can take
             // gigabytes. See RAGSentenceEmbedder. Named by the remote ID even
             // when the bundled copy loads, so both are the same space.
-            return RAGSentenceEmbedder(modelSource: embedderSource(), modelID: configuration.remoteModelID)
+            return RAGSentenceEmbedder(
+                modelSource: embedderSource(),
+                modelID: configuration.remoteModelID,
+                pooling: configuration.sentenceTransformerPooling
+            )
         case .naturalLanguage(let languages):
             return try RAGNaturalLanguageEmbedder(languages: languages)
         case .custom(let embedder):

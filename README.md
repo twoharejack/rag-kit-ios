@@ -41,7 +41,10 @@ corpora, snapshot export/import, and MMR result diversification.
   GPU path held every intermediate of a padded batch at once (16 texts at 512
   tokens peaked at 8.8 GB) and cached a compiled graph for every input shape,
   which was never released. It produces the same vectors, so existing
-  databases and seeds stay valid.
+  databases and seeds stay valid. `Pooling.mean` (opt-in, through
+  `RAGVectorDatabaseConfiguration.sentenceTransformerPooling`) reads the
+  model the way it was trained and ranks far better; see
+  [MiniLM's pooling](#minilms-pooling).
 - `RAGNaturalLanguageEmbedder` — Apple's on-device models (`NLEmbedding`,
   `NLContextualEmbedding`) for a corpus in any mix of languages. Nothing to
   bundle or fetch from Hugging Face.
@@ -59,7 +62,7 @@ corpora, snapshot export/import, and MMR result diversification.
 `RAGVectorDatabaseConfiguration.embeddingEngine` picks one:
 
 ```swift
-.sentenceTransformer                                   // default: MiniLM, the configuration's model fields
+.sentenceTransformer                                   // default: MiniLM, the configuration's model fields and pooling
 .naturalLanguage(languages: [.english, .simplifiedChinese])  // Apple's models; [] = device languages
 .custom(myEmbedder)                                    // any RAGEmbedder
 ```
@@ -80,6 +83,44 @@ engine is skipped, and `importSnapshot` refuses a snapshot from one with
 `RAGError.embeddingSpaceMismatch`, leaving the current database in place.
 Databases written before the record existed are read as the sentence
 transformer's, the only engine there was then, so they open unchanged.
+
+### MiniLM's pooling
+
+A BERT model returns one vector per token, and something has to make them
+one vector for the text. `RAGSentenceEmbedder` has always taken the first
+token's (`[CLS]`), as VecturaEmbeddingsKit's `SwiftEmbedder` did, and that
+stays the default so existing databases and bundled seeds keep answering.
+But all-MiniLM-L6-v2 and its sentence-transformers relatives were trained
+to be read by the mean of their token vectors; their first token was never
+trained to stand for the text, and it barely tells texts apart. Set
+`sentenceTransformerPooling: .mean` for the mean (padding left out, `[CLS]`
+and `[SEP]` in, as sentence-transformers reads it). It is a vector space of
+its own: a database switched to it is cleared and re-embedded, and a
+first-token seed is skipped.
+
+Measured with all-MiniLM-L6-v2 on 76 notes (64 English, the rest in ten
+other languages), with a one-line description of each as the query, under
+VecturaKit's hybrid score:
+
+| | First token | Mean |
+|---|---|---|
+| Cosine of the right note (median) | 0.78 | 0.42 |
+| Cosine of the other notes (median / 90th percentile) | 0.66 / 0.74 | 0.09 / 0.23 |
+| Mean reciprocal rank of the right note | 0.76 | 0.80 |
+| Mean reciprocal rank, eight questions about one note each | 0.52 | 0.73 |
+
+The cutoff has to move with it. With first-token vectors the hybrid score of
+a note that shares no word with the query sits near 0.3–0.4 whatever it is
+about, so the 0.25 cutoff the tarot app tuned lets every note through. With
+the mean, on the same notes and with each note cut into passages of about
+250 words:
+
+| Hybrid cutoff | Right notes kept (descriptions) | Unrelated notes passing (one-word queries) |
+|---|---|---|
+| 0.12 | 91% | 6% |
+| 0.15 | 87% | 1% |
+| 0.20 | 82% | 0% |
+| 0.25 | 72% | 0% |
 
 ### Apple's models, in any language
 
@@ -110,7 +151,7 @@ rank of the right note by embedding alone (ten notes and 24 queries per
 language), except for the last row, which is mean average precision on 71
 English notes, 15 of them nearly empty, with 34 one- and two-word queries:
 
-| Notes in | MiniLM | Apple, scheme 1 | Apple, scheme 2 (now) |
+| Notes in | MiniLM (first token) | Apple, scheme 1 | Apple, scheme 2 (now) |
 |----------|--------|-----------------|-----------------------|
 | English  | 0.90   | 0.83 (sentence model) | 0.80 (Latin model) |
 | French   | 0.76   | 0.86            | 0.93 |
