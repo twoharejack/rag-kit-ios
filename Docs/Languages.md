@@ -1,7 +1,9 @@
 # Languages
 
 RAGKit's two built-in embedding engines differ most in what they do with text
-that is not English. This guide covers:
+that is not English. (The Spotlight engine, `.spotlight`, is not compared
+here: which languages it reads is the system's, not RAGKit's. See the
+README.) This guide covers:
 
 - which engine suits which languages
 - how to configure Apple's engine for a corpus

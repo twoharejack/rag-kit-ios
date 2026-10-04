@@ -4,7 +4,8 @@
 // embedding-engine selection, batched document embedding, and snapshot
 // export/import. Domain-agnostic — hosts supply seed archives, model folders,
 // and document texts, and keep their own document metadata keyed by document
-// ID.
+// ID. On the Spotlight engine the same calls run on the app's Core Spotlight
+// index instead (RAGSpotlightIndex).
 //
 // Not thread-safe on its own: designed to be owned by a single actor (or other
 // single concurrency domain) in the host app.
@@ -53,7 +54,8 @@ public struct RAGVectorDatabaseConfiguration: Sendable {
     /// The database remembers which engine wrote its vectors. Opening it with
     /// an engine that embeds into a different space clears it, and the host
     /// re-embeds its corpus. A bundled seed from another engine is skipped the
-    /// same way.
+    /// same way. `.spotlight` counts as a space of its own, and leaving it
+    /// also takes the database's items out of Spotlight.
     public var embeddingEngine: RAGEmbeddingEngine
 
     public init(
@@ -134,6 +136,8 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// Changes only through `switchEmbeddingEngine(to:)`.
     public private(set) var configuration: RAGVectorDatabaseConfiguration
 
+    /// The VecturaKit engine the vectors live in; `nil` before setup and on
+    /// the Spotlight engine, which keeps none.
     public private(set) var database: VecturaKit?
     public private(set) var directoryURL: URL?
     /// Incremented after snapshot imports and engine switches so UIs can reload.
@@ -145,15 +149,18 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     private var vecturaConfig: VecturaConfig?
     private var storage: RAGDateStampingStorage?
     private var tagStore: RAGDocumentTagStore?
+    /// What the database runs on under `.spotlight`, in place of all of the
+    /// above.
+    private var spotlight: RAGSpotlightIndex?
 
     public init(configuration: RAGVectorDatabaseConfiguration) {
         self.configuration = configuration
     }
 
     /// The vector space of the open database (see `RAGEmbedder`), or `nil`
-    /// before setup.
+    /// before setup. Spotlight's names Spotlight itself.
     public var embeddingSpaceIdentifier: String? {
-        embedder?.spaceIdentifier
+        embedder?.spaceIdentifier ?? spotlight.map { _ in RAGSpotlightIndex.spaceIdentifier }
     }
 
     // MARK: - Setup
@@ -174,13 +181,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
     public func setUp(forceReset: Bool = false) async throws {
         do {
-            let engine = configuration.embeddingEngine
-            let embedder = try makeEmbedder(for: engine)
-            let dimension = try await vectorDimension(of: embedder, engine: engine)
-            try await open(with: embedder, dimension: dimension, forceReset: forceReset)
-            RAGLog.debug("✅ Successfully initialized VecturaKit")
+            try await open(configuration.embeddingEngine, forceReset: forceReset)
+            RAGLog.debug("✅ Successfully initialized \(spotlight == nil ? "VecturaKit" : "the Spotlight index")")
         } catch {
-            RAGLog.error("❌ Failed to initialize VecturaKit: \(error)")
+            RAGLog.error("❌ Failed to initialize the vector database: \(error)")
             throw error
         }
     }
@@ -195,26 +199,62 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// An engine in the same space keeps the vectors.
     ///
     /// The engine is built first, so one that cannot run on this device (Apple
-    /// languages none of which has a model) throws with the database
-    /// untouched. A failure after that (disk, storage) leaves the database
-    /// closed and still configured for the old engine, which `setUp()`
-    /// re-opens. Like `setUp` and `importSnapshot`, call it while nothing else
-    /// is using the database.
+    /// languages none of which has a model, Spotlight where it cannot index)
+    /// throws with the database untouched. A failure after that (disk,
+    /// storage) leaves the database closed and still configured for the old
+    /// engine, which `setUp()` re-opens. Like `setUp` and `importSnapshot`,
+    /// call it while nothing else is using the database.
     public func switchEmbeddingEngine(to engine: RAGEmbeddingEngine) async throws {
         do {
-            let embedder = try makeEmbedder(for: engine)
-            let dimension = try await vectorDimension(of: embedder, engine: engine)
-            let previousSpace = self.embedder?.spaceIdentifier
-            try await open(with: embedder, dimension: dimension, forceReset: false)
+            let previousSpace = embeddingSpaceIdentifier
+            try await open(engine, forceReset: false)
             configuration.embeddingEngine = engine
-            if embedder.spaceIdentifier != previousSpace {
+            if embeddingSpaceIdentifier != previousSpace {
                 revision += 1
             }
-            RAGLog.debug("🔀 Embedding with \(embedder.spaceIdentifier)")
+            RAGLog.debug("🔀 Embedding with \(embeddingSpaceIdentifier ?? "nothing")")
         } catch {
             RAGLog.error("❌ Failed to switch embedding engine: \(error)")
             throw error
         }
+    }
+
+    /// Builds `engine`, then opens the database directory on it. Building
+    /// comes first, so an engine that cannot run here throws before anything
+    /// is closed or cleared.
+    private func open(_ engine: RAGEmbeddingEngine, forceReset: Bool) async throws {
+        if case .spotlight = engine {
+            let index = try RAGSpotlightIndex(databaseName: configuration.name)
+            try await open(spotlight: index, forceReset: forceReset)
+        } else {
+            let embedder = try makeEmbedder(for: engine)
+            let dimension = try await vectorDimension(of: embedder, engine: engine)
+            try await open(with: embedder, dimension: dimension, forceReset: forceReset)
+        }
+    }
+
+    /// Closes whatever is open, so a failure while opening leaves nothing
+    /// half-open behind.
+    private func close() {
+        database = nil
+        embedder = nil
+        vecturaConfig = nil
+        storage = nil
+        tagStore = nil
+        spotlight = nil
+    }
+
+    /// Opens the database directory on Spotlight: VecturaKit's files from
+    /// another engine are cleared (and a seed skipped) like any other
+    /// space's, and the directory keeps Spotlight's records from then on.
+    private func open(spotlight index: RAGSpotlightIndex, forceReset: Bool) async throws {
+        close()
+        let space = RAGEmbeddingSpaceRecord(identifier: RAGSpotlightIndex.spaceIdentifier, dimension: 0)
+        let dbDir = try prepareSeedDirectory(forceReset: forceReset, space: space)
+        directoryURL = dbDir
+        try await index.open(in: dbDir, startOver: forceReset)
+        spotlight = index
+        RAGLog.debug("📁 Spotlight records directory: \(dbDir.path)")
     }
 
     /// Opens the database directory for `embedder`: vectors from another
@@ -224,11 +264,15 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         // Closed first. A failure below then leaves nothing open, rather than
         // the previous engine's handle writing its vectors into a directory
         // that may already be recorded as the new engine's.
-        database = nil
-        self.embedder = nil
-        vecturaConfig = nil
-        storage = nil
-        tagStore = nil
+        close()
+
+        // Leaving Spotlight: the directory is about to be cleared of its
+        // records, and the items they describe would stay in the system's
+        // index, and in its search, with nothing to keep them current.
+        let destination = try databaseDestinationDirectory()
+        if storedSpaceIdentifier(in: destination) == RAGSpotlightIndex.spaceIdentifier {
+            await RAGSpotlightIndex.removeItems(ofDatabaseNamed: configuration.name)
+        }
 
         let space = RAGEmbeddingSpaceRecord(identifier: embedder.spaceIdentifier, dimension: dimension)
         let dbDir = try prepareSeedDirectory(forceReset: forceReset, space: space)
@@ -296,6 +340,11 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// - Note: A filtered search builds a throwaway engine over the matching
     ///   slice, so its text index is rebuilt per call. That is proportional to
     ///   the slice, not the corpus, and unfiltered searches are untouched.
+    ///
+    /// On Spotlight the filters run inside Spotlight's own query, the results
+    /// come in Spotlight's rank order, and each score stands for its place in
+    /// it (1 for the first, a half at the eleventh), not for a similarity, so
+    /// `threshold` keeps a ranked prefix.
     public func search(
         query: String,
         numResults: Int,
@@ -303,10 +352,20 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         dateRange: Range<Date>? = nil,
         tags: [String]? = nil
     ) async throws -> [VecturaSearchResult] {
+        let tagFilter = (tags?.isEmpty == false) ? tags : nil
+        if let spotlight {
+            let hits = try await spotlight.search(
+                query: query,
+                numResults: numResults,
+                threshold: threshold,
+                dateRange: dateRange,
+                tags: tagFilter
+            )
+            return hits.map { VecturaSearchResult(id: $0.id, text: $0.text, score: $0.score, createdAt: $0.date) }
+        }
         guard let database else {
             throw RAGError.notInitialized
         }
-        let tagFilter = (tags?.isEmpty == false) ? tags : nil
         guard dateRange != nil || tagFilter != nil else {
             return try await database.search(
                 query: .text(query),
@@ -362,7 +421,13 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// document with this text would be indexed under. Hosts use it to derive
     /// features from positions in the embedding space (similarity, colors)
     /// without writing anything into the index.
+    ///
+    /// - Throws: `RAGError.spotlightHasNoVectors` on Spotlight, whose vectors
+    ///   never leave the system.
     public func embedText(_ text: String) async throws -> [Float] {
+        if spotlight != nil {
+            throw RAGError.spotlightHasNoVectors
+        }
         guard let embedder else {
             throw RAGError.notInitialized
         }
@@ -371,6 +436,7 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
     /// Checks if the database needs embedding (is empty or missing).
     public func needsEmbedding() async -> Bool {
+        if let spotlight { return spotlight.documentCount == 0 }
         guard let database else { return true }
         do {
             // Read storage directly rather than running a probe search, which
@@ -391,6 +457,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         batchSize: Int = 20,
         progress: EmbeddingProgressTracker? = nil
     ) async throws -> [UUID] {
+        if let spotlight {
+            try await spotlight.removeAll()
+            return try await spotlight.upsert(documents, batchSize: batchSize, progress: progress)
+        }
         guard let database else {
             throw RAGError.notInitialized
         }
@@ -462,6 +532,7 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
     /// Number of documents currently in the index.
     public func documentCount() async throws -> Int {
+        if let spotlight { return spotlight.documentCount }
         guard let database else { throw RAGError.notInitialized }
         return try await database.getAllDocuments().count
     }
@@ -476,6 +547,7 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// whose documents carry dates or tags should diff against this, so a
     /// record left over from before they were known gets re-embedded with them.
     public func indexedDocuments() async throws -> [UUID: RAGIndexedDocument] {
+        if let spotlight { return spotlight.indexedDocuments() }
         guard let database else { throw RAGError.notInitialized }
         let documents = try await database.getAllDocuments()
         let tags = await tagStore?.allTags() ?? [:]
@@ -493,6 +565,7 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// The indexed text, stored date, and tags for one document, or `nil` when
     /// it is not indexed.
     public func indexedDocument(id: UUID) async throws -> RAGIndexedDocument? {
+        if let spotlight { return spotlight.indexedDocument(id: id) }
         guard let database else { throw RAGError.notInitialized }
         guard let document = try await database.getDocument(id: id) else { return nil }
         let tags = await tagStore?.tags(for: id) ?? []
@@ -509,6 +582,9 @@ public final class RAGVectorDatabase: @unchecked Sendable {
         batchSize: Int = 20,
         progress: EmbeddingProgressTracker? = nil
     ) async throws -> [UUID] {
+        if let spotlight {
+            return try await spotlight.upsert(documents, batchSize: batchSize, progress: progress)
+        }
         guard let database else {
             throw RAGError.notInitialized
         }
@@ -581,6 +657,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
     /// Removes documents from the index. Unknown IDs are ignored.
     public func deleteDocuments(ids: [UUID]) async throws {
+        if let spotlight {
+            try await spotlight.delete(ids: ids)
+            return
+        }
         guard let database else { throw RAGError.notInitialized }
         guard !ids.isEmpty else { return }
         try await database.deleteDocuments(ids: ids)
@@ -591,8 +671,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     // MARK: - Snapshot Export/Import
 
     /// Creates a snapshot of the database for export.
+    /// - Throws: `RAGError.spotlightHasNoVectors` on Spotlight.
     @discardableResult
     public func exportSnapshot(to url: URL? = nil) throws -> URL {
+        if spotlight != nil { throw RAGError.spotlightHasNoVectors }
         guard let sourceDir = directoryURL else {
             throw NSError(
                 domain: "RAGVectorDatabase",
@@ -628,8 +710,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     /// Exports the database as a ZIP ready to be shipped as a bundled seed.
     /// The internal structure matches what `prepareSeedDirectory` expects on
     /// extraction.
+    /// - Throws: `RAGError.spotlightHasNoVectors` on Spotlight.
     @discardableResult
     public func exportBundleReadyZip(named zipFileName: String, to directory: URL? = nil) throws -> URL {
+        if spotlight != nil { throw RAGError.spotlightHasNoVectors }
         guard let sourceDir = directoryURL else {
             throw NSError(
                 domain: "RAGVectorDatabase",
@@ -687,8 +771,12 @@ public final class RAGVectorDatabase: @unchecked Sendable {
     ///
     /// - Throws: `RAGError.embeddingSpaceMismatch`, leaving the current
     ///   database in place, when the snapshot was embedded by a different
-    ///   engine than the configured one.
+    ///   engine than the configured one; `RAGError.spotlightHasNoVectors`
+    ///   when the configured engine is Spotlight.
     public func importSnapshot(from snapshotURL: URL) async throws {
+        if case .spotlight = configuration.embeddingEngine {
+            throw RAGError.spotlightHasNoVectors
+        }
         let fm = FileManager.default
         let destDir = try databaseDestinationDirectory()
 
@@ -915,7 +1003,7 @@ public final class RAGVectorDatabase: @unchecked Sendable {
 
     /// Builds the engine a configuration names. Only an engine that cannot
     /// run on this device throws, and it does so before anything on disk
-    /// changes.
+    /// changes. Spotlight has no embedder to build.
     private func makeEmbedder(for engine: RAGEmbeddingEngine) throws -> any RAGEmbedder {
         switch engine {
         case .sentenceTransformer:
@@ -932,6 +1020,10 @@ public final class RAGVectorDatabase: @unchecked Sendable {
             return try RAGNaturalLanguageEmbedder(languages: languages)
         case .custom(let embedder):
             return embedder
+        case .spotlight:
+            // Spotlight embeds inside the system; `open(_:forceReset:)`
+            // opens it without an embedder.
+            throw RAGError.spotlightHasNoVectors
         }
     }
 

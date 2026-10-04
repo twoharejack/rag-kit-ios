@@ -1,10 +1,11 @@
 # RAGKit
 
 Generic on-device RAG engine extracted from the Nimue app: a VecturaKit-backed
-vector database with bundled-seed setup, switchable embedding engines (a
-sentence-transformer, or Apple's own multilingual models), batched document
-embedding with progress reporting, incremental upsert/delete for live
-corpora, snapshot export/import, and MMR result diversification.
+vector database with bundled-seed setup, switchable engines (a
+sentence-transformer, Apple's own multilingual models, or Apple's Spotlight
+index), batched document embedding with progress reporting, incremental
+upsert/delete for live corpora, snapshot export/import, and MMR result
+diversification.
 
 ## What lives here
 
@@ -48,6 +49,10 @@ corpora, snapshot export/import, and MMR result diversification.
 - `RAGNaturalLanguageEmbedder` — Apple's on-device models (`NLEmbedding`,
   `NLContextualEmbedding`) for a corpus in any mix of languages. Nothing to
   bundle or fetch from Hugging Face.
+- `RAGEmbeddingEngine.spotlight` — the app's own Core Spotlight index in
+  place of VecturaKit: Spotlight indexes the documents and ranks them, by
+  their words and by their meaning. See
+  [Apple's Spotlight index](#apples-spotlight-index).
 - `MMRDiversifier` — Maximal Marginal Relevance re-ranking with an optional
   host-supplied concept key for duplicate collapsing.
 - `EmbeddingProgressTracker` — `ObservableObject` progress for embedding UI.
@@ -65,6 +70,7 @@ corpora, snapshot export/import, and MMR result diversification.
 .sentenceTransformer                                   // default: MiniLM, the configuration's model fields and pooling
 .naturalLanguage(languages: [.english, .simplifiedChinese])  // Apple's models; [] = device languages
 .custom(myEmbedder)                                    // any RAGEmbedder
+.spotlight                                             // the app's Core Spotlight index; no vectors in the app
 ```
 
 To let the user change it at runtime, call
@@ -188,10 +194,69 @@ language. It also covers:
 - how much of a long text each engine reads
 - where search cutoffs land in each language
 
+### Apple's Spotlight index
+
+`.spotlight` runs the database on the app's own on-device Spotlight index
+instead of VecturaKit. Each document becomes one `CSSearchableItem`: its text
+as `textContent`, its date as `contentCreationDate`, and its tags in a custom
+attribute that filters can test but a typed query never matches. A search is
+a `CSUserQuery` with ranked results, which matches the query's words and,
+where the system offers it, its meaning, in the languages the system's
+search reads. Nothing is bundled, downloaded, or embedded in the app. Check
+`RAGEmbeddingEngine.isSpotlightAvailable` first: not every device can index.
+
+The rest of the database works as it does on the vector engines:
+`upsertDocuments`, `deleteDocuments`, `indexedDocuments()` for diffing,
+`documentCount()`, `needsEmbedding()`, `switchEmbeddingEngine(to:)`. The date
+and tag filters of `search` run inside Spotlight as filter queries, so they
+narrow the corpus before it is ranked. What Spotlight cannot hand back (it
+never returns an item's text) is kept beside it, one record file per
+document in the database directory, and the records are also the last word
+on what a search may return.
+
+The records only describe Spotlight while Spotlight keeps the items, so the
+two are tied together. Items never expire (Spotlight's default is a month). A
+generation token is stored both in the directory and as the index's client
+state, which lives inside Spotlight: when they disagree on open (a restored
+backup, an index the system rebuilt, the app's index deleted), both start
+over, empty, and the host's next diff re-indexes everything. And when
+Spotlight asks the app to re-index items, which it does after losing them,
+their records go.
+
+What differs:
+
+- **No vectors.** `embedText` throws `RAGError.spotlightHasNoVectors`, and so
+  do snapshot export and import. A host that derives features from vectors
+  needs another embedder for them.
+- **Scores are ranks.** Spotlight ranks; it does not score. A result's score
+  is `1 / (1 + rank / 10)`: 1 for the first, a half at the eleventh, a
+  quarter at the thirty-first. It keeps Spotlight's order and stays within
+  0…1 for code that blends scores or compares them to the best one, but a
+  threshold only caps how many results come back.
+- **Meaning arrives later than words.** Measured on macOS 27 with a dozen
+  short notes: a note matched a query on one of its words as soon as
+  `indexSearchableItems` returned. The query's own embedding was made
+  in-process in under a millisecond. Each item's embedding is made by the
+  system's Spotlight pipeline (`spotlightknowledged`) as an intensive
+  background task, and the scheduler held that back while the Mac was in use.
+  Forty-five minutes after indexing, no note matched a query that shared no
+  word with it. Expect meaning matches for new documents once the system has
+  processed them, which on a phone in use may be the next idle charge.
+- **The system's search shows them.** Everything an app indexes into
+  Spotlight can appear in the system's own search under the app, unless the
+  person turns that off for the app in Settings.
+- **Results come in batches.** RAGKit waits for the whole answer and sorts
+  it by rank (`CSUserQuery.Item`'s `<`; ascending is best first, which on a
+  query every note matched equally put the newest first).
+
+Leaving `.spotlight` for another engine removes the database's items from
+Spotlight as well as the records from the directory.
+
 ### Scores differ by engine
 
 VecturaKit's hybrid score is `0.5 × cosine + 0.5 × min(BM25 / 10, 1)`, so a
-threshold tuned for one engine does not carry over to another. Apple's
+threshold tuned for one engine does not carry over to another. Spotlight's
+scores are ranks, not similarities (see above). Apple's
 engine centers each block (it subtracts the model's mean over fixed reference
 sentences) and takes its length directions out. Raw contextual vectors all
 point the same way: unrelated notes averaged 0.70 against a query and the
@@ -207,6 +272,7 @@ tuned on scheme 1 now lets more through. Tune thresholds per engine.
   the sentence-transformer model folder and any pre-embedded database ZIP and
   passes their URLs in through the configuration — the same split
   SupertonicTTS uses for its ONNX models. Apple's models ship with the OS, or
-  the system downloads them on the app's request.
+  the system downloads them on the app's request; Spotlight's are the
+  system's own.
 - Domain logic. Document schemas, embedding-text construction, query
   building, and result filtering stay in the host app.

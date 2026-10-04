@@ -9,6 +9,13 @@ public enum RAGError: LocalizedError {
     /// A snapshot was embedded in a different vector space than the one the
     /// database is configured for, so its vectors cannot answer its queries.
     case embeddingSpaceMismatch(snapshot: String, database: String)
+    /// This device cannot index into Spotlight, so a database cannot run on
+    /// `RAGEmbeddingEngine.spotlight`.
+    case spotlightUnavailable
+    /// The database runs on Spotlight, which keeps its vectors to itself:
+    /// there is no embedding to hand out, and no vector files to export or
+    /// import.
+    case spotlightHasNoVectors
 
     public var errorDescription: String? {
         switch self {
@@ -20,6 +27,10 @@ public enum RAGError: LocalizedError {
             return "Apple's embedding model for \"\(language)\" is not available on this device."
         case .embeddingSpaceMismatch(let snapshot, let database):
             return "The snapshot was embedded with \(snapshot), but the database embeds with \(database)."
+        case .spotlightUnavailable:
+            return "Spotlight indexing is not available on this device."
+        case .spotlightHasNoVectors:
+            return "The database searches with Spotlight, which keeps no vectors the app can read."
         }
     }
 }

@@ -20,7 +20,9 @@ import VecturaKit
 ///
 /// `RAGSentenceEmbedder` and `RAGNaturalLanguageEmbedder` both conform, and
 /// the database only ever talks to this protocol, so a host can bring its own
-/// engine through `RAGEmbeddingEngine.custom`.
+/// engine through `RAGEmbeddingEngine.custom`. Spotlight
+/// (`RAGEmbeddingEngine.spotlight`) is the one engine that is not an embedder:
+/// it keeps its vectors inside the system.
 public protocol RAGEmbedder: VecturaEmbedder {
     /// Names the vector space this engine embeds into: the model, plus
     /// anything else that moves where a text lands (its language, its
@@ -30,11 +32,11 @@ public protocol RAGEmbedder: VecturaEmbedder {
     var spaceIdentifier: String { get }
 }
 
-/// Which engine a `RAGVectorDatabase` embeds documents and queries with. Every
-/// case resolves to a `RAGEmbedder`, so indexing, search, and `embedText`
-/// work the same whichever one is chosen. Only the vectors differ, and so do
-/// the scores they produce: see the README before reusing a search threshold
-/// across engines.
+/// Which engine a `RAGVectorDatabase` embeds documents and queries with.
+/// Every case but `.spotlight` resolves to a `RAGEmbedder`, so indexing,
+/// search, and `embedText` work the same whichever of them is chosen. Only the
+/// vectors differ, and so do the scores they produce: see the README before
+/// reusing a search threshold across engines.
 public enum RAGEmbeddingEngine: Sendable {
     /// The BERT sentence-transformer named by the configuration's model fields
     /// (all-MiniLM-L6-v2 in the shipped apps), run on the CPU by
@@ -50,4 +52,14 @@ public enum RAGEmbeddingEngine: Sendable {
     case naturalLanguage(languages: [NLLanguage])
     /// Any other engine, built by the host.
     case custom(any RAGEmbedder)
+    /// Apple's Core Spotlight: documents go into the app's own on-device
+    /// Spotlight index, and searches run through `CSUserQuery`, which matches
+    /// a query's words and, once the system has processed a document, its
+    /// meaning, in whatever languages the system's search reads. Nothing to
+    /// bundle, download, or embed in the app. The database keeps no vectors:
+    /// `embedText` throws `RAGError.spotlightHasNoVectors`, scores stand for
+    /// Spotlight's rank order rather than a similarity, and the documents
+    /// also appear in the system's own search under the app. Check
+    /// `RAGEmbeddingEngine.isSpotlightAvailable` first. See the README.
+    case spotlight
 }
