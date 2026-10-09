@@ -410,9 +410,17 @@ final class RAGSpotlightIndex {
     /// both: "tomatoes OR tomato". Not a form shorter than three letters:
     /// "go", from "goes", also begins "good" and "got", and pushed the
     /// right note for "where my money goes each month" out of the top 10.
+    ///
+    /// A word the query quotes is searched quoted, and so is its dictionary
+    /// form: `"tomatoes" OR "tomato"`. Quoted, Spotlight matches a word only
+    /// whole and never reads it as a date, so a host that quotes its words
+    /// for that keeps it in the word searches too. Left bare, `art` from
+    /// `"art"` found the notes about an artichoke, an article and an artist,
+    /// and `september` every note captured in September.
     static func wordQueries(_ query: String) -> [String] {
         let tagger = NLTagger(tagSchemes: [.lemma])
         tagger.string = query
+        let quotedRanges = quotedRanges(in: query)
         var seen = Set<String>()
         var queries: [String] = []
         tagger.enumerateTags(
@@ -423,10 +431,12 @@ final class RAGSpotlightIndex {
         ) { lemma, range in
             let word = String(query[range])
             guard seen.insert(word.lowercased()).inserted else { return true }
+            let isQuoted = quotedRanges.contains { $0.contains(range.lowerBound) }
+            let form: (String) -> String = isQuoted ? { "\"\($0)\"" } : { $0 }
             if let lemma = lemma?.rawValue, lemma.count >= 3, lemma.lowercased() != word.lowercased() {
-                queries.append("\(word) OR \(lemma)")
+                queries.append("\(form(word)) OR \(form(lemma))")
             } else {
-                queries.append(word)
+                queries.append(form(word))
             }
             return queries.count < maxQueryWords
         }
@@ -434,6 +444,22 @@ final class RAGSpotlightIndex {
     }
 
     static let maxQueryWords = 8
+
+    /// The stretches of `query` between pairs of straight double quotes. A
+    /// quote mark left without a partner opens nothing.
+    private static func quotedRanges(in query: String) -> [Range<String.Index>] {
+        var ranges: [Range<String.Index>] = []
+        var opening: String.Index?
+        for index in query.indices where query[index] == "\"" {
+            if let start = opening {
+                ranges.append(query.index(after: start)..<index)
+                opening = nil
+            } else {
+                opening = index
+            }
+        }
+        return ranges
+    }
 
     /// One ranking from Spotlight's answer to the whole query and to each of
     /// its words.

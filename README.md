@@ -245,7 +245,11 @@ What differs:
   0.12 to 0.51 while Spotlight matched nothing by meaning. While it did,
   runs scored 0.44 and 0.54 before and 0.66 and 0.56 after (without the
   dictionary forms, which added 0.02 with meaning off). A search takes
-  about half a second, a little more than the whole query alone.
+  about half a second, a little more than the whole query alone. A word the
+  query quotes is searched quoted, with its dictionary form quoted too
+  (`"tomatoes" OR "tomato"`): Spotlight matches a quoted word only whole and
+  never reads it as a date, so `"art"` does not find "artichoke" and
+  `"september"` does not find every note captured in September.
 - **Meaning comes and goes.** Measured on macOS 27 with a dozen short notes,
   45 minutes after indexing no note matched a query that shared no word with
   it: each item's embedding is made by the system's Spotlight pipeline

@@ -22,6 +22,18 @@ struct RAGSpotlightSearchTests {
         #expect(RAGSpotlightIndex.wordQueries(long).count == RAGSpotlightIndex.maxQueryWords)
     }
 
+    @Test("A quoted word is searched quoted, with its dictionary form")
+    func quotedWordQueries() {
+        #expect(RAGSpotlightIndex.wordQueries("\"art\" \"class\"") == ["\"art\"", "\"class\""])
+        #expect(RAGSpotlightIndex.wordQueries("\"september\"") == ["\"september\""])
+        let mixed = RAGSpotlightIndex.wordQueries("When can the \"tomatoes\" go outside?")
+        #expect(mixed.contains("\"tomatoes\" OR \"tomato\""))
+        #expect(mixed.contains("the"))
+        #expect(RAGSpotlightIndex.wordQueries("\"tax return\" due") == ["\"tax\"", "\"return\"", "due"])
+        // A quote mark without a partner quotes nothing.
+        #expect(RAGSpotlightIndex.wordQueries("\"art class") == ["art", "class"])
+    }
+
     @Test("Spotlight's answer to the whole query leads")
     func wholeQueryLeads() {
         let merged = RAGSpotlightIndex.merge(
