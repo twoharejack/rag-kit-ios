@@ -44,5 +44,22 @@ let package = Package(
             // RAGVectorDatabaseConfiguration — mirroring how SupertonicTTS
             // receives its model directories.
         ),
+        .testTarget(
+            name: "RAGKitTests",
+            dependencies: ["RAGKit"]
+        ),
+        // Retrieval-accuracy evals. The metric, prompt and harness tests run
+        // on every `swift test`; the eval itself, which downloads MiniLM and
+        // calls the `claude` and `codex` CLIs as relevance judges, runs only
+        // when RAGKIT_EVAL_ENGINES or RAGKIT_EVAL_JUDGES is set. See
+        // Docs/Evals.md.
+        .testTarget(
+            name: "RAGKitEvalTests",
+            dependencies: ["RAGKit"],
+            // Read and written through #filePath, not as bundle resources:
+            // the judges' cache lives beside the set it grades, in the source
+            // tree, so it can be committed and re-runs only grade new pairs.
+            exclude: ["Fixtures"]
+        ),
     ]
 )

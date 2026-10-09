@@ -233,21 +233,36 @@ What differs:
   quarter at the thirty-first. It keeps Spotlight's order and stays within
   0…1 for code that blends scores or compares them to the best one, but a
   threshold only caps how many results come back.
-- **Meaning arrives later than words.** Measured on macOS 27 with a dozen
-  short notes: a note matched a query on one of its words as soon as
-  `indexSearchableItems` returned. The query's own embedding was made
-  in-process in under a millisecond. Each item's embedding is made by the
-  system's Spotlight pipeline (`spotlightknowledged`) as an intensive
-  background task, and the scheduler held that back while the Mac was in use.
-  Forty-five minutes after indexing, no note matched a query that shared no
-  word with it. Expect meaning matches for new documents once the system has
-  processed them, which on a phone in use may be the next idle charge.
+- **Spotlight's own answer is short.** It matches a note by its words only
+  when every word of the query begins a word of the note ("tax return"
+  finds the tax note, "tax return due" does not), and by meaning at most one
+  note. On the eval's 40 queries over 54 notes it never answered with more
+  than one note, and often with none. So RAGKit also searches each word of
+  the query on its own, and also its dictionary form ("tomatoes OR tomato"),
+  side by side with the whole query. Spotlight's answer leads, and the notes
+  holding the most and rarest of the words (BM25's IDF) fill the rest.
+  Against [the eval](Docs/Evals.md)'s hand labels, that took nDCG@10 from
+  0.12 to 0.51 while Spotlight matched nothing by meaning. While it did,
+  runs scored 0.44 and 0.54 before and 0.66 and 0.56 after (without the
+  dictionary forms, which added 0.02 with meaning off). A search takes
+  about half a second, a little more than the whole query alone.
+- **Meaning comes and goes.** Measured on macOS 27 with a dozen short notes,
+  45 minutes after indexing no note matched a query that shared no word with
+  it: each item's embedding is made by the system's Spotlight pipeline
+  (`spotlightknowledged`) as an intensive background task, which the
+  scheduler held back while the Mac was in use. With the eval's notes,
+  meaning matches came within seconds of indexing on some runs ("bugs eating
+  my flowers" found the note about aphids on a rose), and on others within
+  the same hour, on the same index, not at all. The words always match.
 - **The system's search shows them.** Everything an app indexes into
   Spotlight can appear in the system's own search under the app, unless the
   person turns that off for the app in Settings.
 - **Results come in batches.** RAGKit waits for the whole answer and sorts
-  it by rank (`CSUserQuery.Item`'s `<`; ascending is best first, which on a
-  query every note matched equally put the newest first).
+  it by rank, best first: `CSUserQuery.Item`'s `>`, not `<`, which put the
+  note holding every word of "sourdough OR starter OR the" below six notes
+  holding only "the". Spotlight ranks only `maxRankedResultCount` matches
+  and returns the rest unranked, mixed in among them, so RAGKit has every
+  match ranked.
 
 Leaving `.spotlight` for another engine removes the database's items from
 Spotlight as well as the records from the directory.
@@ -265,6 +280,26 @@ steps, the cosine of the right note averaged 0.35–0.60 and of the others
 0.17–0.46, depending on the language, and notes in another script score 0.
 That is higher than scheme 1 scored (0.23–0.43 and 0.10–0.29), so a cutoff
 tuned on scheme 1 now lets more through. Tune thresholds per engine.
+
+## Measuring retrieval
+
+`Tests/RAGKitEvalTests` scores the engines on a corpus of 54 notes and 40
+queries, with Claude (`claude`) and OpenAI's models (`codex`) grading every
+note each engine returns:
+
+```bash
+RAGKIT_EVAL_JUDGES=claude,codex swift test --filter RetrievalEvalTests
+```
+
+On it, mean-pooled MiniLM ranks best: a judged nDCG@10 of 0.76, against
+0.67 for first-token MiniLM, 0.66 for Apple's models, and 0.43 for words
+alone. Apple's models lead on one-word queries and on notes in other
+languages.
+
+A plain `swift test` runs only the harness, which needs no model or LLM. The
+judges' grades are cached in the repository, so a re-run calls them only about
+notes they have not graded. [Docs/Evals.md](Docs/Evals.md) covers the
+results, the options, running it on your own notes, and its limits.
 
 ## What deliberately does not live here
 

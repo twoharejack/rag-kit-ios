@@ -7,6 +7,7 @@
 
 import CoreSpotlight
 import Foundation
+import NaturalLanguage
 import UniformTypeIdentifiers
 
 extension RAGEmbeddingEngine {
@@ -62,11 +63,13 @@ extension RAGEmbeddingEngine {
 ///   spent), and 45 minutes after indexing no note matched a query that
 ///   shares no word with it. So a document is found by its words straight
 ///   away, and by its meaning once the system has processed it, which on a
-///   phone in use may not be the same day.
-/// - Ranked results come back in batches, not in order. Sorted ascending
-///   (`CSUserQuery.Item`'s `<`, which is `compare(byRank:)`), the best comes
-///   first: on a query every note matched equally, that order was newest to
-///   oldest by `contentCreationDate`.
+///   phone in use may not be the same day. With the eval's 54 notes,
+///   meaning matches came within seconds of indexing on some runs, and on
+///   others within the same hour, on the same index, not at all.
+/// - Ranked results come back in batches, not in order, and sorted
+///   descending (`CSUserQuery.Item`'s `>`) the best comes first. Only the
+///   first `maxRankedResultCount` are ranked; the rest still come back, and
+///   sort in among them unranked. See `search`.
 /// - Filter queries on `domainIdentifier`, on `contentCreationDate` against
 ///   `$time.iso(…)`, and on a multi-valued custom attribute (`==` matches any
 ///   value; `||` inside one filter, several filters AND together) all
@@ -334,27 +337,37 @@ final class RAGSpotlightIndex {
             isWarm = true
             await Self.warmUpQuery()
         }
-        let context = CSUserQueryContext()
-        context.fetchAttributes = []
-        context.filterQueries = filterQueries(dateRange: dateRange, tags: tags)
-        context.enableRankedResults = true
-        context.maxRankedResultCount = numResults
-        context.maxSuggestionCount = 0
-        let userQuery = CSUserQuery(userQueryString: query, userQueryContext: context)
+        let filters = filterQueries(dateRange: dateRange, tags: tags)
+        // Every match ranked. Spotlight returns the matches past
+        // maxRankedResultCount as well, unranked, and they sort in among the
+        // ranked ones: with three ranked, the one note holding every word of
+        // "sourdough OR starter OR the" sorted below notes holding only
+        // "the". Ranking all of them was no slower.
+        let rankLimit = max(records.count, numResults)
 
-        var found: [CSUserQuery.Item] = []
-        for try await response in userQuery.responses {
-            if case .item(let item) = response {
-                found.append(item)
+        // The query, and each of its words on its own, side by side. The
+        // words cost little: with them the search took 0.56 s, without them
+        // 0.49 s.
+        async let wholeQuery = Self.rankedIdentifiers(matching: query, filters: filters, rankLimit: rankLimit)
+        let wordMatches = try await withThrowingTaskGroup(of: [String].self) { group in
+            for word in Self.wordQueries(query) where word.caseInsensitiveCompare(query) != .orderedSame {
+                group.addTask {
+                    try await Self.rankedIdentifiers(matching: word, filters: filters, rankLimit: rankLimit)
+                }
             }
+            var lists: [[String]] = []
+            for try await list in group {
+                lists.append(list)
+            }
+            return lists
         }
+        let ranked = Self.merge(wholeQuery: try await wholeQuery, wordMatches: wordMatches, documentCount: records.count)
         try Task.checkCancellation()
-        found.sort(by: <)
 
         let wanted = tags.map(Set.init)
         var hits: [Hit] = []
-        for item in found {
-            guard let id = documentID(forIdentifier: item.item.uniqueIdentifier),
+        for identifier in ranked {
+            guard let id = documentID(forIdentifier: identifier),
                   let record = records.record(for: id) else { continue }
             if let dateRange, !dateRange.contains(record.date) { continue }
             if let wanted, wanted.isDisjoint(with: record.tags) { continue }
@@ -363,8 +376,107 @@ final class RAGSpotlightIndex {
             hits.append(Hit(id: id, text: record.text, score: score, date: record.date))
             if hits.count == numResults { break }
         }
-        RAGLog.debug("🔦 Spotlight matched \(found.count) items, answered \(hits.count)")
+        RAGLog.debug("🔦 Spotlight matched \(ranked.count) items, answered \(hits.count)")
         return hits
+    }
+
+    /// The identifiers of the items Spotlight matches to `text`, best first.
+    private static func rankedIdentifiers(matching text: String, filters: [String], rankLimit: Int) async throws -> [String] {
+        let context = CSUserQueryContext()
+        context.fetchAttributes = []
+        context.filterQueries = filters
+        context.enableRankedResults = true
+        context.maxRankedResultCount = rankLimit
+        context.maxSuggestionCount = 0
+        var found: [CSUserQuery.Item] = []
+        for try await response in CSUserQuery(userQueryString: text, userQueryContext: context).responses {
+            if case .item(let item) = response {
+                found.append(item)
+            }
+        }
+        // Descending is best first. Ascending put the note holding every word
+        // of "sourdough OR starter OR the" below six that hold only "the".
+        return found.sorted(by: >).map(\.item.uniqueIdentifier)
+    }
+
+    /// A Spotlight query for each distinct word of `query`, in order: at
+    /// most eight, so a pasted paragraph does not fan out into a hundred
+    /// queries. Words are found by `NLTagger`, not at spaces, so Chinese and
+    /// Japanese queries have words too.
+    ///
+    /// Spotlight matches a query word only where it begins a word of the
+    /// note, so "tomatoes" misses a note about a tomato, and "eating" one
+    /// that says "eat". A word whose dictionary form differs is searched as
+    /// both: "tomatoes OR tomato". Not a form shorter than three letters:
+    /// "go", from "goes", also begins "good" and "got", and pushed the
+    /// right note for "where my money goes each month" out of the top 10.
+    static func wordQueries(_ query: String) -> [String] {
+        let tagger = NLTagger(tagSchemes: [.lemma])
+        tagger.string = query
+        var seen = Set<String>()
+        var queries: [String] = []
+        tagger.enumerateTags(
+            in: query.startIndex..<query.endIndex,
+            unit: .word,
+            scheme: .lemma,
+            options: [.omitWhitespace, .omitPunctuation, .omitOther]
+        ) { lemma, range in
+            let word = String(query[range])
+            guard seen.insert(word.lowercased()).inserted else { return true }
+            if let lemma = lemma?.rawValue, lemma.count >= 3, lemma.lowercased() != word.lowercased() {
+                queries.append("\(word) OR \(lemma)")
+            } else {
+                queries.append(word)
+            }
+            return queries.count < maxQueryWords
+        }
+        return queries
+    }
+
+    static let maxQueryWords = 8
+
+    /// One ranking from Spotlight's answer to the whole query and to each of
+    /// its words.
+    ///
+    /// Spotlight's own answer is precise and short. It matches a note by its
+    /// words only when every word of the query begins a word of the note
+    /// ("tax return" finds the tax note, "tax return due" does not), and by
+    /// its meaning at most one note, and only a close one. On the eval's 40
+    /// queries over 54 notes it never answered with more than one note, and
+    /// often with none.
+    ///
+    /// So its answer leads, and behind it come the notes that hold some of
+    /// the query's words. Each word counts by BM25's IDF, so a rare word
+    /// ("sourdough") counts for far more than a common one ("the"), which
+    /// counts for almost nothing; notes of equal weight go by how high the
+    /// words' own searches ranked them. With Spotlight matching nothing by
+    /// meaning, this took nDCG@10 on those queries, against hand labels,
+    /// from 0.12 to 0.51.
+    ///
+    /// BM25's length normalization is left out. Spotlight does not say how
+    /// often a note holds a word, so a long note could never earn back the
+    /// length it is penalized for: the one note about the Skye ferry fell
+    /// from first to third for a question about it. Nearly empty notes rose
+    /// instead, "todo" for the "to" in "flight to Chengdu". Over the 40
+    /// queries it gained nothing.
+    static func merge(wholeQuery: [String], wordMatches: [[String]], documentCount: Int) -> [String] {
+        let documents = Double(documentCount)
+        var weight: [String: Double] = [:]
+        var placing: [String: Double] = [:]
+        for matches in wordMatches where !matches.isEmpty {
+            let holding = Double(matches.count)
+            // BM25's IDF, in the form that never turns negative.
+            let idf = log(1 + max(documents - holding + 0.5, 0) / (holding + 0.5))
+            for (rank, identifier) in matches.enumerated() {
+                weight[identifier, default: 0] += idf
+                placing[identifier, default: 0] += 1 / Double(10 + rank)
+            }
+        }
+        let byWords = weight.keys.sorted {
+            (weight[$0, default: 0], placing[$0, default: 0], $1) > (weight[$1, default: 0], placing[$1, default: 0], $0)
+        }
+        var seen = Set<String>()
+        return (wholeQuery + byWords).filter { seen.insert($0).inserted }
     }
 
     /// The score a result carries for its place in Spotlight's ranking, best
