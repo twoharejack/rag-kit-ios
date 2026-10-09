@@ -245,7 +245,11 @@ What differs:
   0.12 to 0.51 while Spotlight matched nothing by meaning. While it did,
   runs scored 0.44 and 0.54 before and 0.66 and 0.56 after (without the
   dictionary forms, which added 0.02 with meaning off). A search takes
-  about half a second, a little more than the whole query alone. A word the
+  about half a second, a little more than the whole query alone. A note
+  whose words weigh under 0.4 of the rarest word's IDF does not fill: a
+  note holding only "in" and "the" does not answer "in the garden". That
+  took the notes the judges graded unrelated from 5.0 to 3.3 per top 10,
+  and nDCG@10 against the labels stayed the same. A word the
   query quotes is searched quoted, with its dictionary form quoted too
   (`"tomatoes" OR "tomato"`): Spotlight matches a quoted word only whole and
   never reads it as a date, so `"art"` does not find "artichoke" and

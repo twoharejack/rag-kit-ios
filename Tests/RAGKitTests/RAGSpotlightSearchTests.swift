@@ -50,7 +50,21 @@ struct RAGSpotlightSearchTests {
         let the = ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "s"]
         let merged = RAGSpotlightIndex.merge(wholeQuery: [], wordMatches: [the, ["s"]], documentCount: 10)
         #expect(merged.first == "s")
-        #expect(Set(merged) == Set(the))
+        // "trip" is in 3 of 10, "weekend" in 2: one of them is enough.
+        let trips = RAGSpotlightIndex.merge(wholeQuery: [], wordMatches: [["a", "b", "c"], ["a", "d"]], documentCount: 10)
+        #expect(trips == ["a", "d", "b", "c"])
+    }
+
+    @Test("A note holding only words far commoner than the rarest is left out")
+    func commonWordsAloneDoNotFill() {
+        // "in the garden": "the" in 8 of 10, "in" in 7, "garden" in one.
+        let the = ["x1", "x2", "x3", "x4", "x5", "x6", "x7", "g"]
+        let inWord = ["x1", "x2", "x3", "y1", "y2", "y3", "g"]
+        let merged = RAGSpotlightIndex.merge(wholeQuery: [], wordMatches: [inWord, the, ["g"]], documentCount: 10)
+        #expect(merged == ["g"])
+        // The whole query's answer is never held to it.
+        let led = RAGSpotlightIndex.merge(wholeQuery: ["x5"], wordMatches: [the, ["g"]], documentCount: 10)
+        #expect(led == ["x5", "g"])
     }
 
     @Test("Equal weight goes by the words' own ranking, then identifier")

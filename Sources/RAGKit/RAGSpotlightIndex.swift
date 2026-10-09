@@ -479,6 +479,17 @@ final class RAGSpotlightIndex {
     /// meaning, this took nDCG@10 on those queries, against hand labels,
     /// from 0.12 to 0.51.
     ///
+    /// A note the words alone found has to weigh at least 0.4 of the rarest
+    /// word's IDF (``fillFloor``), or it is left out: a note holding only
+    /// "in" and "the" does not answer "in the garden". Without the floor,
+    /// such notes filled every place the rarer words left. On the eval's 40
+    /// queries, with meaning off, it took the notes the judges graded
+    /// unrelated from 5.0 to 3.3 per top 10. nDCG@10 against the labels
+    /// stayed the same (0.51), and against the judges it fell by less than
+    /// 0.005, as a few notes graded "related" went. At a half it also lost
+    /// relevant ones: the dog-training note for "teaching the new dog to
+    /// come when called".
+    ///
     /// BM25's length normalization is left out. Spotlight does not say how
     /// often a note holds a word, so a long note could never earn back the
     /// length it is penalized for: the one note about the Skye ferry fell
@@ -489,21 +500,30 @@ final class RAGSpotlightIndex {
         let documents = Double(documentCount)
         var weight: [String: Double] = [:]
         var placing: [String: Double] = [:]
+        var rarest = 0.0
         for matches in wordMatches where !matches.isEmpty {
             let holding = Double(matches.count)
             // BM25's IDF, in the form that never turns negative.
             let idf = log(1 + max(documents - holding + 0.5, 0) / (holding + 0.5))
+            rarest = max(rarest, idf)
             for (rank, identifier) in matches.enumerated() {
                 weight[identifier, default: 0] += idf
                 placing[identifier, default: 0] += 1 / Double(10 + rank)
             }
         }
-        let byWords = weight.keys.sorted {
-            (weight[$0, default: 0], placing[$0, default: 0], $1) > (weight[$1, default: 0], placing[$1, default: 0], $0)
-        }
+        let floor = rarest * fillFloor
+        let byWords = weight.keys
+            .filter { weight[$0, default: 0] >= floor }
+            .sorted {
+                (weight[$0, default: 0], placing[$0, default: 0], $1) > (weight[$1, default: 0], placing[$1, default: 0], $0)
+            }
         var seen = Set<String>()
         return (wholeQuery + byWords).filter { seen.insert($0).inserted }
     }
+
+    /// How much of the rarest word's IDF a note the words alone found must
+    /// weigh to be answered. See `merge`.
+    static let fillFloor = 0.4
 
     /// The score a result carries for its place in Spotlight's ranking, best
     /// first from 0: 1, then 1 / (1 + rank / 10) — a half at the eleventh
